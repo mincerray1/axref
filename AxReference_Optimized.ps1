@@ -897,6 +897,21 @@ function AxRef-WriteDocs([string]$out, $info, $sel, $roles, $fileMap) {
     $kw = ($info.Keywords | ForEach-Object { '`' + $_ + '`' }) -join ', '
     $nameFilters = ($info.ObjectNameContains | ForEach-Object { '`' + $_ + '`' }) -join ', '
     if (-not $nameFilters) { $nameFilters = '(none)' }
+    $manifestRows = @{}
+    $manifestPath = Join-Path $out 'MANIFEST.md'
+    if (Test-Path $manifestPath) {
+        foreach ($line in [System.IO.File]::ReadLines($manifestPath)) {
+            if (-not $line.StartsWith('|')) { continue }
+            $fields = $line.Trim().Trim('|').Split('|')
+            if ($fields.Count -lt 4) { continue }
+            $type = $fields[0].Trim()
+            $name = $fields[1].Trim()
+            if (-not $type -or $type -eq 'Type' -or $type -match '^-+$') { continue }
+            $manifestRows[($type + '|' + $name).ToLowerInvariant()] = [pscustomobject]@{
+                Type = $type; Name = $name; Files = $fields[2].Trim(); Roles = $fields[3].Trim()
+            }
+        }
+    }
 
     # ---- manifest
     $mf = New-Object System.Text.StringBuilder
@@ -914,7 +929,12 @@ function AxRef-WriteDocs([string]$out, $info, $sel, $roles, $fileMap) {
     foreach ($el in ($sel.Values | Sort-Object Type, Name)) {
         $files = ($fileMap[$el.Key] -join '<br>')
         $r = ($roles[$el.Key] -join '; ')
-        [void]$mf.AppendLine("| $($el.Type) | $($el.Name) | $files | $r |")
+        $manifestRows[$el.Key] = [pscustomobject]@{
+            Type = $el.Type; Name = $el.Name; Files = $files; Roles = $r
+        }
+    }
+    foreach ($row in ($manifestRows.Values | Sort-Object Type, Name)) {
+        [void]$mf.AppendLine("| $($row.Type) | $($row.Name) | $($row.Files) | $($row.Roles) |")
     }
     [System.IO.File]::WriteAllText((Join-Path $out 'MANIFEST.md'), $mf.ToString(), (New-Object System.Text.UTF8Encoding($false)))
 
@@ -1005,7 +1025,7 @@ Static text analysis, so treat it as a good guide, not a guarantee:
 
     $doc = $doc.Replace('{{KEYWORDS}}', $kw).Replace('{{OBJECTNAMEFRAGMENTS}}', $nameFilters)
     $doc = $doc.Replace('{{CALLERDEPTH}}', [string]$info.CallerDepth).Replace('{{CALLEDDEPTH}}', [string]$info.CalledDepth)
-    $doc = $doc.Replace('{{COUNT}}', [string]$sel.Count).Replace('{{PROJECT}}', $projText)
+    $doc = $doc.Replace('{{COUNT}}', [string]$manifestRows.Count).Replace('{{PROJECT}}', $projText)
     [System.IO.File]::WriteAllText((Join-Path $out 'AGENTS.md'), $doc, (New-Object System.Text.UTF8Encoding($false)))
 
     $gitignore = @'
@@ -1065,7 +1085,7 @@ function Export-AxReference {
         }
     }
     if ($kws.Count -eq 0 -and $nameFilters.Count -eq 0) {
-        Write-Host 'Enter keywords one at a time. Press Enter on an empty line to finish keyword entry.'
+        Write-Host 'Enter keywords one at a time. Press Enter to skip/finish keyword entry; you can add object-name fragments next.'
         while ($true) {
             $k = Read-Host ('Keyword #' + ($kws.Count + 1))
             if ([string]::IsNullOrWhiteSpace($k)) { break }
@@ -1093,9 +1113,7 @@ function Export-AxReference {
     # output folder
     $out = Join-Path $cwd 'reference'
     if (Test-Path $out) {
-        $a = AxRef-Ask "'reference' already exists. Delete and recreate it? (y/N, N = use a timestamped name)" 'N'
-        if ($a -match '^(y|yes)$') { Remove-Item -Recurse -Force $out }
-        else { $out = Join-Path $cwd ('reference_' + (Get-Date).ToString('yyyyMMdd_HHmmss')) }
+        Write-Host "Keeping existing reference folder '$out'. Existing objects will only be replaced after confirmation."
     }
 
     # ---- index + hits
@@ -1186,6 +1204,22 @@ function Export-AxReference {
         $wi++
         Write-Progress -Activity 'Writing sanitized files' -Status ('{0} / {1}   {2}' -f $wi, $sel.Count, $el.Name) -PercentComplete ([int](100 * $wi / [Math]::Max(1, $sel.Count)))
         $dir = Join-Path $out $el.Type
+        $existingFiles = New-Object System.Collections.Generic.List[string]
+        foreach ($suffix in @('', '_top', '_cus')) {
+            $candidate = Join-Path $dir ($el.Name + $suffix + '.xpp')
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $existingFiles.Add($candidate) }
+        }
+        if ($existingFiles.Count -gt 0) {
+            $answer = AxRef-Ask ("Object '{0}\{1}' already exists. Replace its file(s)? (y/N)" -f $el.Type, $el.Name) 'N'
+            if ($answer -notmatch '^(y|yes)$') {
+                $names = New-Object System.Collections.Generic.List[string]
+                foreach ($path in $existingFiles) { $names.Add(($el.Type + '\' + [System.IO.Path]::GetFileName($path))) }
+                $fileMap[$el.Key] = $names
+                Write-Host ("Kept existing object: {0}\{1}" -f $el.Type, $el.Name)
+                continue
+            }
+            foreach ($path in $existingFiles) { Remove-Item -LiteralPath $path -Force }
+        }
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
         $both = ($el.TopPath -and $el.CusPath)
         $names = New-Object System.Collections.Generic.List[string]
@@ -1224,11 +1258,19 @@ function Export-AxReference {
         }
         if ($tpl) {
             $pf = Join-Path $out ($ProjectName + '.xpo')
-            $missing = AxRef-WriteProject $tpl $ProjectName ($sel.Values) $pf
-            $projectFile = $ProjectName + '.xpo'
-            if ($missing.Count -gt 0) {
-                Write-Warning ('No template for these object types, so those objects are NOT in the project: ' + (($missing | Sort-Object -Unique) -join '; '))
+            $replaceProject = $true
+            if (Test-Path -LiteralPath $pf -PathType Leaf) {
+                $answer = AxRef-Ask ("Project '{0}' already exists. Replace it? (y/N)" -f $ProjectName) 'N'
+                $replaceProject = ($answer -match '^(y|yes)$')
             }
+            if ($replaceProject) {
+                $missing = AxRef-WriteProject $tpl $ProjectName ($sel.Values) $pf
+                $projectFile = $ProjectName + '.xpo'
+                if ($missing.Count -gt 0) {
+                    Write-Warning ('No template for these object types, so those objects are NOT in the project: ' + (($missing | Sort-Object -Unique) -join '; '))
+                }
+            }
+            else { $projectFile = $ProjectName + '.xpo'; Write-Host 'Kept existing project XPO.' }
         }
         else { Write-Warning 'Project xpo skipped (no template).' }
     }

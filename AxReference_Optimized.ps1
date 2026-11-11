@@ -6,10 +6,12 @@
 #
 #       axref                       (asks everything interactively)
 #       axref -TopFolder top -CusFolder cus -Keyword SalesLineGrouping -CallerDepth 4
-#       axref -Keyword validateWrite -ObjectNameContains PurchAgree,SalesLine
-#       axref -ObjectNameContains PurchAgree
+#       axref -Keyword validateWrite -ObjectNameContains PurchAgree,SalesLine -CusObjectPrefix Fox
+#       axref -ObjectNameContains PurchAgree -CusObjectPrefix Fox
+#       axref -BuildIndex
 #
 #  Works on Windows PowerShell 5.1 and PowerShell 7.
+#  Uses the Windows-provided winsqlite3.dll; no external SQLite package is needed.
 # ============================================================================
 
 $script:AxRefDir = Join-Path $HOME '.axref'
@@ -240,8 +242,313 @@ function AxRef-ParseText([string]$text, [string]$relDir, [string]$fileName) {
 }
 
 # ===========================================================================
-#  index cache (one tab separated file per top/cus pair)
+#  SQLite index cache (one database per top/cus pair)
 # ===========================================================================
+function AxRef-SqliteEnsureNative {
+    if ('AxRefSqliteNative' -as [type]) { return }
+    $dll = Join-Path $env:WINDIR 'System32\winsqlite3.dll'
+    if (-not (Test-Path -LiteralPath $dll)) {
+        throw "Windows SQLite library not found: $dll"
+    }
+    $source = @'
+using System;
+using System.Runtime.InteropServices;
+public static class AxRefSqliteNative {
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, CharSet=CharSet.Unicode, EntryPoint="sqlite3_open16")]
+    public static extern int Open(string path, out IntPtr db);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_close")]
+    public static extern int Close(IntPtr db);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_busy_timeout")]
+    public static extern int BusyTimeout(IntPtr db, int milliseconds);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, CharSet=CharSet.Ansi, EntryPoint="sqlite3_exec")]
+    public static extern int Exec(IntPtr db, string sql, IntPtr callback, IntPtr arg, out IntPtr errorMessage);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_errmsg16")]
+    public static extern IntPtr ErrorMessage(IntPtr db);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_free")]
+    public static extern void Free(IntPtr value);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, CharSet=CharSet.Unicode, EntryPoint="sqlite3_prepare16_v2")]
+    public static extern int Prepare(IntPtr db, string sql, int bytes, out IntPtr statement, IntPtr tail);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_finalize")]
+    public static extern int Finalize(IntPtr statement);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, CharSet=CharSet.Unicode, EntryPoint="sqlite3_bind_text16")]
+    public static extern int BindText(IntPtr statement, int index, string value, int bytes, IntPtr destructor);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_bind_int64")]
+    public static extern int BindInt64(IntPtr statement, int index, long value);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_step")]
+    public static extern int Step(IntPtr statement);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_reset")]
+    public static extern int Reset(IntPtr statement);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_clear_bindings")]
+    public static extern int ClearBindings(IntPtr statement);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_column_int64")]
+    public static extern long ColumnInt64(IntPtr statement, int column);
+    [DllImport("winsqlite3.dll", CallingConvention=CallingConvention.Cdecl, EntryPoint="sqlite3_column_text16")]
+    public static extern IntPtr ColumnText(IntPtr statement, int column);
+}
+'@
+    Add-Type -TypeDefinition $source -ErrorAction Stop | Out-Null
+}
+
+function AxRef-SqliteOpen([string]$file) {
+    AxRef-SqliteEnsureNative
+    $db = [IntPtr]::Zero
+    $rc = [AxRefSqliteNative]::Open($file, [ref]$db)
+    if ($rc -ne 0) {
+        $message = 'SQLite open failed with code ' + $rc
+        if ($db -ne [IntPtr]::Zero) {
+            $p = [AxRefSqliteNative]::ErrorMessage($db)
+            if ($p -ne [IntPtr]::Zero) { $message = [Runtime.InteropServices.Marshal]::PtrToStringUni($p) }
+            [void][AxRefSqliteNative]::Close($db)
+        }
+        throw $message
+    }
+    [void][AxRefSqliteNative]::BusyTimeout($db, 30000)
+    return $db
+}
+
+function AxRef-SqliteExec($db, [string]$sql) {
+    $errorMessage = [IntPtr]::Zero
+    $rc = [AxRefSqliteNative]::Exec($db, $sql, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$errorMessage)
+    if ($rc -ne 0) {
+        $message = 'SQLite command failed with code ' + $rc
+        if ($errorMessage -ne [IntPtr]::Zero) {
+            $message = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($errorMessage)
+            [AxRefSqliteNative]::Free($errorMessage)
+        }
+        throw $message
+    }
+}
+
+function AxRef-SqlitePrepare($db, [string]$sql) {
+    $statement = [IntPtr]::Zero
+    $rc = [AxRefSqliteNative]::Prepare($db, $sql, -1, [ref]$statement, [IntPtr]::Zero)
+    if ($rc -ne 0) {
+        $p = [AxRefSqliteNative]::ErrorMessage($db)
+        $message = 'SQLite prepare failed with code ' + $rc
+        if ($p -ne [IntPtr]::Zero) { $message = [Runtime.InteropServices.Marshal]::PtrToStringUni($p) }
+        throw $message
+    }
+    return $statement
+}
+
+function AxRef-SqliteBindText($statement, [int]$index, [string]$value) {
+    if ($null -eq $value) { $value = '' }
+    $rc = [AxRefSqliteNative]::BindText($statement, $index, $value, -1, [IntPtr](-1))
+    if ($rc -ne 0) { throw "SQLite text binding failed with code $rc" }
+}
+
+function AxRef-SqliteBindInt64($statement, [int]$index, [int64]$value) {
+    $rc = [AxRefSqliteNative]::BindInt64($statement, $index, $value)
+    if ($rc -ne 0) { throw "SQLite integer binding failed with code $rc" }
+}
+
+function AxRef-SqliteRun($statement) {
+    $rc = [AxRefSqliteNative]::Step($statement)
+    if ($rc -ne 101) { throw "SQLite write failed with code $rc" }
+    [void][AxRefSqliteNative]::Reset($statement)
+    [void][AxRefSqliteNative]::ClearBindings($statement)
+}
+
+function AxRef-SqliteColumnText($statement, [int]$column) {
+    $p = [AxRefSqliteNative]::ColumnText($statement, $column)
+    if ($p -eq [IntPtr]::Zero) { return '' }
+    return [Runtime.InteropServices.Marshal]::PtrToStringUni($p)
+}
+
+function AxRef-SqliteSchema($db) {
+    AxRef-SqliteExec $db 'PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS Meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS Files (
+  layer TEXT NOT NULL, rel TEXT NOT NULL, ticks INTEGER NOT NULL, len INTEGER NOT NULL,
+  type TEXT NOT NULL, name TEXT NOT NULL, decl_refs TEXT NOT NULL,
+  PRIMARY KEY (layer, rel));
+CREATE TABLE IF NOT EXISTS Methods (
+  layer TEXT NOT NULL, rel TEXT NOT NULL, owner TEXT NOT NULL, name TEXT NOT NULL,
+  calls TEXT NOT NULL, refs TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS Edges (
+  source_layer TEXT NOT NULL, source_rel TEXT NOT NULL, source_owner TEXT NOT NULL,
+  source_method TEXT NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS IX_Files_Name ON Files(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS IX_Methods_File ON Methods(layer, rel);
+CREATE INDEX IF NOT EXISTS IX_Edges_Target ON Edges(target COLLATE NOCASE, kind);
+CREATE INDEX IF NOT EXISTS IX_Edges_Source ON Edges(source_layer, source_rel);'
+}
+
+function AxRef-SqliteCreateStatements($db) {
+    return @{
+        UpsertFile = (AxRef-SqlitePrepare $db 'INSERT INTO Files(layer,rel,ticks,len,type,name,decl_refs) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(layer,rel) DO UPDATE SET ticks=excluded.ticks,len=excluded.len,type=excluded.type,name=excluded.name,decl_refs=excluded.decl_refs')
+        DeleteMethods = (AxRef-SqlitePrepare $db 'DELETE FROM Methods WHERE layer=?1 AND rel=?2')
+        DeleteEdges = (AxRef-SqlitePrepare $db 'DELETE FROM Edges WHERE source_layer=?1 AND source_rel=?2')
+        InsertMethod = (AxRef-SqlitePrepare $db 'INSERT INTO Methods(layer,rel,owner,name,calls,refs) VALUES(?1,?2,?3,?4,?5,?6)')
+        InsertEdge = (AxRef-SqlitePrepare $db 'INSERT INTO Edges(source_layer,source_rel,source_owner,source_method,kind,target) VALUES(?1,?2,?3,?4,?5,?6)')
+        DeleteFile = (AxRef-SqlitePrepare $db 'DELETE FROM Files WHERE layer=?1 AND rel=?2')
+    }
+}
+
+function AxRef-SqliteDisposeStatements($statements) {
+    foreach ($statement in $statements.Values) {
+        if ($statement -ne [IntPtr]::Zero) { [void][AxRefSqliteNative]::Finalize($statement) }
+    }
+}
+
+function AxRef-SqliteStoreEntry($statements, $entry) {
+    $layer = [string]$entry.Layer
+    $rel = [string]$entry.Rel
+    $deleteMethods = $statements.DeleteMethods
+    AxRef-SqliteBindText $deleteMethods 1 $layer
+    AxRef-SqliteBindText $deleteMethods 2 $rel
+    AxRef-SqliteRun $deleteMethods
+    $deleteEdges = $statements.DeleteEdges
+    AxRef-SqliteBindText $deleteEdges 1 $layer
+    AxRef-SqliteBindText $deleteEdges 2 $rel
+    AxRef-SqliteRun $deleteEdges
+
+    $file = $statements.UpsertFile
+    AxRef-SqliteBindText $file 1 $layer
+    AxRef-SqliteBindText $file 2 $rel
+    AxRef-SqliteBindInt64 $file 3 $entry.Ticks
+    AxRef-SqliteBindInt64 $file 4 $entry.Len
+    AxRef-SqliteBindText $file 5 ([string]$entry.Type)
+    AxRef-SqliteBindText $file 6 ([string]$entry.Name)
+    AxRef-SqliteBindText $file 7 ([string]$entry.DeclRefs)
+    AxRef-SqliteRun $file
+
+    foreach ($method in $entry.Methods) {
+        $insert = $statements.InsertMethod
+        AxRef-SqliteBindText $insert 1 $layer
+        AxRef-SqliteBindText $insert 2 $rel
+        AxRef-SqliteBindText $insert 3 ([string]$method.Owner)
+        AxRef-SqliteBindText $insert 4 ([string]$method.Name)
+        AxRef-SqliteBindText $insert 5 ([string]$method.Calls)
+        AxRef-SqliteBindText $insert 6 ([string]$method.Refs)
+        AxRef-SqliteRun $insert
+        foreach ($edgeSet in @(@('call', [string]$method.Calls), @('ref', [string]$method.Refs))) {
+            foreach ($target in $edgeSet[1].Split(',')) {
+                if (-not $target) { continue }
+                $edge = $statements.InsertEdge
+                AxRef-SqliteBindText $edge 1 $layer
+                AxRef-SqliteBindText $edge 2 $rel
+                AxRef-SqliteBindText $edge 3 ([string]$method.Owner)
+                AxRef-SqliteBindText $edge 4 ([string]$method.Name)
+                AxRef-SqliteBindText $edge 5 ([string]$edgeSet[0])
+                AxRef-SqliteBindText $edge 6 $target
+                AxRef-SqliteRun $edge
+            }
+        }
+    }
+    foreach ($target in ([string]$entry.DeclRefs).Split(',')) {
+        if (-not $target) { continue }
+        $edge = $statements.InsertEdge
+        AxRef-SqliteBindText $edge 1 $layer
+        AxRef-SqliteBindText $edge 2 $rel
+        AxRef-SqliteBindText $edge 3 ''
+        AxRef-SqliteBindText $edge 4 ''
+        AxRef-SqliteBindText $edge 5 'decl'
+        AxRef-SqliteBindText $edge 6 $target
+        AxRef-SqliteRun $edge
+    }
+}
+
+function AxRef-SqliteLoadEntries($db, [string]$topRoot, [string]$cusRoot, [bool]$includeMethods) {
+    $entries = @{}
+    $countStatement = AxRef-SqlitePrepare $db 'SELECT count(*) FROM Files'
+    try {
+        $countRc = [AxRefSqliteNative]::Step($countStatement)
+        if ($countRc -ne 100) { throw "SQLite file count failed with code $countRc" }
+        $fileTotal = [AxRefSqliteNative]::ColumnInt64($countStatement, 0)
+    }
+    finally { [void][AxRefSqliteNative]::Finalize($countStatement) }
+    $statement = AxRef-SqlitePrepare $db 'SELECT layer,rel,ticks,len,type,name,decl_refs FROM Files'
+    try {
+        $loaded = 0
+        while (($rc = [AxRefSqliteNative]::Step($statement)) -eq 100) {
+            $loaded++
+            $layer = AxRef-SqliteColumnText $statement 0
+            $rel = AxRef-SqliteColumnText $statement 1
+            $root = if ($layer -eq 'top') { $topRoot } else { $cusRoot }
+            $entry = [pscustomobject]@{
+                Layer = $layer; Rel = $rel; Path = (Join-Path $root $rel)
+                Ticks = [AxRefSqliteNative]::ColumnInt64($statement, 2)
+                Len = [AxRefSqliteNative]::ColumnInt64($statement, 3)
+                Type = (AxRef-SqliteColumnText $statement 4)
+                Name = (AxRef-SqliteColumnText $statement 5)
+                DeclRefs = (AxRef-SqliteColumnText $statement 6)
+                Methods = (New-Object System.Collections.Generic.List[object])
+            }
+            $entries[($layer + '|' + $rel)] = $entry
+            if (($loaded % 1000) -eq 0 -or $loaded -eq $fileTotal) {
+                $pct = [int](100 * $loaded / [Math]::Max(1, $fileTotal))
+                Write-Progress -Activity 'Indexing XPO files' -Status ("Loading SQLite file index: {0} / {1}" -f $loaded, $fileTotal) -PercentComplete $pct
+            }
+        }
+        if ($rc -ne 101) { throw "SQLite file read failed with code $rc" }
+    }
+    finally { [void][AxRefSqliteNative]::Finalize($statement) }
+
+    if (-not $includeMethods) { return $entries }
+    $countStatement = AxRef-SqlitePrepare $db 'SELECT count(*) FROM Methods'
+    try {
+        $countRc = [AxRefSqliteNative]::Step($countStatement)
+        if ($countRc -ne 100) { throw "SQLite method count failed with code $countRc" }
+        $methodTotal = [AxRefSqliteNative]::ColumnInt64($countStatement, 0)
+    }
+    finally { [void][AxRefSqliteNative]::Finalize($countStatement) }
+    $statement = AxRef-SqlitePrepare $db 'SELECT layer,rel,owner,name,calls,refs FROM Methods'
+    try {
+        $loadedMethods = 0
+        while (($rc = [AxRefSqliteNative]::Step($statement)) -eq 100) {
+            $loadedMethods++
+            $key = (AxRef-SqliteColumnText $statement 0) + '|' + (AxRef-SqliteColumnText $statement 1)
+            if ($entries.ContainsKey($key)) {
+                $entries[$key].Methods.Add([pscustomobject]@{
+                    Owner = (AxRef-SqliteColumnText $statement 2)
+                    Name = (AxRef-SqliteColumnText $statement 3)
+                    Calls = (AxRef-SqliteColumnText $statement 4)
+                    Refs = (AxRef-SqliteColumnText $statement 5)
+                })
+            }
+            if (($loadedMethods % 5000) -eq 0 -or $loadedMethods -eq $methodTotal) {
+                $pct = [int](100 * $loadedMethods / [Math]::Max(1, $methodTotal))
+                Write-Progress -Activity 'Indexing XPO files' -Status ("Loading SQLite method index: {0} / {1}" -f $loadedMethods, $methodTotal) -PercentComplete $pct
+            }
+        }
+        if ($rc -ne 101) { throw "SQLite method read failed with code $rc" }
+    }
+    finally { [void][AxRefSqliteNative]::Finalize($statement) }
+    return $entries
+}
+
+function AxRef-SqliteMetaValue($db, [string]$key) {
+    $statement = AxRef-SqlitePrepare $db 'SELECT value FROM Meta WHERE key=?1'
+    try {
+        AxRef-SqliteBindText $statement 1 $key
+        $rc = [AxRefSqliteNative]::Step($statement)
+        if ($rc -eq 100) { return (AxRef-SqliteColumnText $statement 0) }
+        if ($rc -ne 101) { throw "SQLite metadata read failed with code $rc" }
+        return ''
+    }
+    finally { [void][AxRefSqliteNative]::Finalize($statement) }
+}
+
+function AxRef-SqliteReadEdgeSources($statement, [string]$target, [string]$kind) {
+    $sources = New-Object System.Collections.Generic.List[object]
+    AxRef-SqliteBindText $statement 1 $target
+    AxRef-SqliteBindText $statement 2 $kind
+    while (($rc = [AxRefSqliteNative]::Step($statement)) -eq 100) {
+        $sources.Add([pscustomobject]@{
+            Layer = (AxRef-SqliteColumnText $statement 0)
+            Type = (AxRef-SqliteColumnText $statement 1)
+            Name = (AxRef-SqliteColumnText $statement 2)
+            Owner = (AxRef-SqliteColumnText $statement 3)
+            Method = (AxRef-SqliteColumnText $statement 4)
+        })
+    }
+    if ($rc -ne 101) { throw "SQLite reverse-reference lookup failed with code $rc" }
+    [void][AxRefSqliteNative]::Reset($statement)
+    [void][AxRefSqliteNative]::ClearBindings($statement)
+    return , $sources
+}
+
 function AxRef-ReadCache([string]$file) {
     $map = @{}
     try {
@@ -267,32 +574,6 @@ function AxRef-ReadCache([string]$file) {
         return @{}
     }
     return $map
-}
-
-function AxRef-WriteCache([string]$file, $map) {
-    $tempFile = $file + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
-    try {
-        $sw = New-Object System.IO.StreamWriter($tempFile, $false, (New-Object System.Text.UTF8Encoding($false)))
-        try {
-            foreach ($e in $map.Values) {
-                $sw.WriteLine(("E`t{0}`t{1}`t{2}`t{3}`t{4}`t{5}`t{6}" -f $e.Layer, $e.Rel, $e.Ticks, $e.Len, $e.Type, $e.Name, $e.DeclRefs))
-                foreach ($m in $e.Methods) {
-                    $sw.WriteLine(("M`t{0}`t{1}`t{2}`t{3}" -f $m.Owner, $m.Name, $m.Calls, $m.Refs))
-                }
-            }
-        }
-        finally { $sw.Dispose() }
-
-        if ([System.IO.File]::Exists($file)) {
-            [System.IO.File]::Replace($tempFile, $file, $null)
-        }
-        else {
-            [System.IO.File]::Move($tempFile, $file)
-        }
-    }
-    finally {
-        if ([System.IO.File]::Exists($tempFile)) { [System.IO.File]::Delete($tempFile) }
-    }
 }
 
 function AxRef-GetKeywordHitPaths([string[]]$roots, [string[]]$keywords) {
@@ -326,127 +607,251 @@ function AxRef-GetKeywordHitPaths([string[]]$roots, [string[]]$keywords) {
     return , $paths
 }
 
-# Uses ripgrep to shortlist keyword files and parses only new or changed XPOs.
-function AxRef-BuildIndex([string]$topRoot, [string]$cusRoot, [string[]]$keywords, [bool]$rebuild) {
+# Builds or incrementally updates the SQLite XPO and reverse-reference index.
+function AxRef-BuildIndex([string]$topRoot, [string]$cusRoot, [string[]]$keywords, [bool]$rebuild, [bool]$indexOnly = $false) {
     New-Item -ItemType Directory -Force -Path $script:AxRefDir | Out-Null
     $md5 = [System.Security.Cryptography.MD5]::Create()
     $hash = [System.BitConverter]::ToString($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$topRoot|$cusRoot"))).Replace('-', '')
-    $cacheFile = Join-Path $script:AxRefDir "index_$hash.tsv"
+    $dbFile = Join-Path $script:AxRefDir "index_$hash.sqlite3"
+    $legacyFile = Join-Path $script:AxRefDir "index_$hash.tsv"
 
     $act = 'Indexing XPO files'
     Write-Progress -Activity $act -Status 'Loading cache...' -PercentComplete 0
+    $db = AxRef-SqliteOpen $dbFile
+    $statements = $null
+    $transactionOpen = $false
+    $cancelled = $false
     $old = @{}
-    if (-not $rebuild -and (Test-Path $cacheFile)) { $old = AxRef-ReadCache $cacheFile }
     $new = @{}
     $hits = New-Object System.Collections.Generic.List[object]
     $hitTexts = @{}
     $parsed = 0
-
-    # list all files first so we can show "x / total"
-    Write-Progress -Activity $act -Status 'Counting files...' -PercentComplete 0
-    $work = New-Object System.Collections.Generic.List[object]
-    foreach ($pair in @(@('top', $topRoot), @('cus', $cusRoot))) {
-        $di = New-Object System.IO.DirectoryInfo($pair[1])
-        foreach ($fi in $di.EnumerateFiles('*.xpo', [System.IO.SearchOption]::AllDirectories)) {
-            $work.Add([pscustomobject]@{ Layer = $pair[0]; Root = $pair[1]; File = $fi })
-        }
-    }
-    $total = $work.Count
-    Write-Host ("Found {0} XPO files." -f $total)
-
-    $hitPaths = AxRef-GetKeywordHitPaths @($topRoot, $cusRoot) $keywords
-    if ($null -ne $hitPaths) {
-        Write-Host ("ripgrep shortlisted {0} keyword-matching XPO files." -f $hitPaths.Count)
-    }
-
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $lastUi = -1000
     $i = 0
-    foreach ($w in $work) {
-        $i++
-        $layer = $w.Layer; $root = $w.Root; $fi = $w.File
+    $total = 0
+    try {
+        AxRef-SqliteSchema $db
+        $statements = AxRef-SqliteCreateStatements $db
 
-        if (($sw.ElapsedMilliseconds - $lastUi) -ge 250 -or $i -eq $total) {
-            $lastUi = $sw.ElapsedMilliseconds
-            $pct = [int](100 * $i / $total)
-            $eta = [System.TimeSpan]::FromMilliseconds($sw.ElapsedMilliseconds / $i * ($total - $i))
-            $status = ('{0} / {1} ({2}%)   elapsed {3}   remaining ~{4}   re-parsed {5}   keyword hits {6}' -f `
-                $i, $total, $pct, $sw.Elapsed.ToString('hh\:mm\:ss'), $eta.ToString('hh\:mm\:ss'), $parsed, $hits.Count)
-            Write-Progress -Activity $act -Status $status -PercentComplete $pct -CurrentOperation ($layer + ': ' + $fi.Name)
+        if ((AxRef-SqliteMetaValue $db 'legacy_tsv_imported') -ne '1') {
+            if (-not $rebuild -and (Test-Path -LiteralPath $legacyFile)) {
+                $legacy = AxRef-ReadCache $legacyFile
+                $legacyCount = $legacy.Count
+                $migrated = 0
+                if ($legacyCount -gt 0) {
+                    AxRef-SqliteExec $db 'BEGIN'
+                    $transactionOpen = $true
+                    foreach ($entry in $legacy.Values) {
+                        AxRef-SqliteStoreEntry $statements $entry
+                        $migrated++
+                        if (($migrated % 500) -eq 0) {
+                            AxRef-SqliteExec $db 'COMMIT'
+                            $transactionOpen = $false
+                            $pct = [int](100 * $migrated / $legacyCount)
+                            Write-Progress -Activity $act -Status ("Importing existing TSV cache: {0} / {1}" -f $migrated, $legacyCount) -PercentComplete $pct
+                            AxRef-SqliteExec $db 'BEGIN'
+                            $transactionOpen = $true
+                        }
+                    }
+                    AxRef-SqliteExec $db 'COMMIT'
+                    $transactionOpen = $false
+                }
+            }
+            AxRef-SqliteExec $db "INSERT OR REPLACE INTO Meta(key,value) VALUES('legacy_tsv_imported','1')"
         }
+        $legacy = $null
+        $old = AxRef-SqliteLoadEntries $db $topRoot $cusRoot (-not $indexOnly)
 
-        $rel = $fi.FullName.Substring($root.Length).TrimStart('\', '/')
-        $ck = $layer + '|' + $rel
-        $e = $old[$ck]
-        $unchanged = ($e -and $e.Ticks -eq $fi.LastWriteTimeUtc.Ticks -and $e.Len -eq $fi.Length)
-        $isHit = $false
-        if ($null -eq $hitPaths) {
-            $text = [System.IO.File]::ReadAllText($fi.FullName)
-            foreach ($k in $keywords) {
-                if ($text.IndexOf($k, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    $isHit = $true
-                    break
+        # List files first so the progress bar can show percentage and ETA.
+        Write-Progress -Activity $act -Status 'Counting XPO files...' -PercentComplete 0
+        $work = New-Object System.Collections.Generic.List[object]
+        $counted = 0
+        foreach ($pair in @(@('top', $topRoot), @('cus', $cusRoot))) {
+            $di = New-Object System.IO.DirectoryInfo($pair[1])
+            foreach ($fi in $di.EnumerateFiles('*.xpo', [System.IO.SearchOption]::AllDirectories)) {
+                $work.Add([pscustomobject]@{ Layer = $pair[0]; Root = $pair[1]; File = $fi })
+                $counted++
+                if (($counted % 1000) -eq 0) {
+                    Write-Progress -Activity $act -Status ("Counting XPO files: {0} found..." -f $counted) -PercentComplete 0
                 }
             }
         }
-        else {
-            $isHit = $hitPaths.Contains($fi.FullName)
-            if (-not $unchanged -or $isHit) { $text = [System.IO.File]::ReadAllText($fi.FullName) }
+        $total = $work.Count
+        Write-Host ("Found {0} XPO files." -f $total)
+
+        $hitPaths = AxRef-GetKeywordHitPaths @($topRoot, $cusRoot) $keywords
+        if ($null -ne $hitPaths -and $keywords.Count -gt 0) {
+            Write-Host ("ripgrep shortlisted {0} keyword-matching XPO files." -f $hitPaths.Count)
         }
 
-        if (-not $unchanged) {
-            $relDir = [System.IO.Path]::GetDirectoryName($rel)
-            if ($null -eq $relDir) { $relDir = '' }
-            $p = AxRef-ParseText $text $relDir $fi.Name
-            $e = [pscustomobject]@{
-                Layer = $layer; Rel = $rel; Path = ''; Ticks = $fi.LastWriteTimeUtc.Ticks; Len = $fi.Length
-                Type = $p.Type; Name = $p.Name; DeclRefs = $p.DeclRefs; Methods = $p.Methods
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastUi = -1000
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        AxRef-SqliteExec $db 'BEGIN'
+        $transactionOpen = $true
+        try {
+            foreach ($w in $work) {
+                $i++
+                $layer = $w.Layer; $root = $w.Root; $fi = $w.File
+
+                if (($sw.ElapsedMilliseconds - $lastUi) -ge 250 -or $i -eq $total) {
+                    $lastUi = $sw.ElapsedMilliseconds
+                    $pct = [int](100 * $i / [Math]::Max(1, $total))
+                    $eta = [System.TimeSpan]::FromMilliseconds($sw.ElapsedMilliseconds / [Math]::Max(1, $i) * ($total - $i))
+                    $status = ('{0} / {1} ({2}%)   elapsed {3}   remaining ~{4}   re-parsed {5}   keyword hits {6}' -f `
+                        $i, $total, $pct, $sw.Elapsed.ToString('hh\:mm\:ss'), $eta.ToString('hh\:mm\:ss'), $parsed, $hits.Count)
+                    Write-Progress -Activity $act -Status $status -PercentComplete $pct -CurrentOperation ($layer + ': ' + $fi.Name)
+                }
+
+                $rel = $fi.FullName.Substring($root.Length).TrimStart('\', '/')
+                $ck = $layer + '|' + $rel
+                [void]$seen.Add($ck)
+                $e = $old[$ck]
+                $unchanged = ($e -and -not $rebuild -and $e.Ticks -eq $fi.LastWriteTimeUtc.Ticks -and $e.Len -eq $fi.Length)
+                $isHit = $false
+                $text = $null
+                if ($null -eq $hitPaths) {
+                    $text = [System.IO.File]::ReadAllText($fi.FullName)
+                    foreach ($k in $keywords) {
+                        if ($text.IndexOf($k, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                            $isHit = $true
+                            break
+                        }
+                    }
+                }
+                else {
+                    $isHit = $hitPaths.Contains($fi.FullName)
+                    if (-not $unchanged -or $isHit) { $text = [System.IO.File]::ReadAllText($fi.FullName) }
+                }
+
+                if (-not $unchanged) {
+                    $relDir = [System.IO.Path]::GetDirectoryName($rel)
+                    if ($null -eq $relDir) { $relDir = '' }
+                    $p = AxRef-ParseText $text $relDir $fi.Name
+                    $e = [pscustomobject]@{
+                        Layer = $layer; Rel = $rel; Path = ''; Ticks = $fi.LastWriteTimeUtc.Ticks; Len = $fi.Length
+                        Type = $p.Type; Name = $p.Name; DeclRefs = $p.DeclRefs; Methods = $p.Methods
+                    }
+                    AxRef-SqliteStoreEntry $statements $e
+                    $parsed++
+                }
+                $e.Path = $fi.FullName
+                $new[$ck] = $e
+                if ($isHit) {
+                    $hits.Add($e)
+                    if ($null -ne $text) { $hitTexts[$ck] = $text }
+                }
+
+                if (($i % 250) -eq 0 -and $i -lt $total) {
+                    AxRef-SqliteExec $db 'COMMIT'
+                    $transactionOpen = $false
+                    AxRef-SqliteExec $db 'BEGIN'
+                    $transactionOpen = $true
+                }
             }
-            $parsed++
         }
-        $e.Path = $fi.FullName
-        $new[$ck] = $e
-        if ($isHit) {
-            $hits.Add($e)
-            if ($null -ne $text) { $hitTexts[$ck] = $text }
+        catch {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException] -or $_.FullyQualifiedErrorId -match 'PipelineStopped') {
+                $cancelled = $true
+            }
+            else { throw }
         }
+
+        if ($transactionOpen) {
+            AxRef-SqliteExec $db 'COMMIT'
+            $transactionOpen = $false
+        }
+
+        if (-not $cancelled) {
+            $deleteMethods = $statements.DeleteMethods
+            $deleteEdges = $statements.DeleteEdges
+            $deleteFile = $statements.DeleteFile
+            $removed = 0
+            AxRef-SqliteExec $db 'BEGIN'
+            $transactionOpen = $true
+            foreach ($key in $old.Keys) {
+                if ($seen.Contains($key)) { continue }
+                $entry = $old[$key]
+                foreach ($stmt in @($deleteMethods, $deleteEdges, $deleteFile)) {
+                    AxRef-SqliteBindText $stmt 1 ([string]$entry.Layer)
+                    AxRef-SqliteBindText $stmt 2 ([string]$entry.Rel)
+                    AxRef-SqliteRun $stmt
+                }
+                $removed++
+                if (($removed % 500) -eq 0) {
+                    AxRef-SqliteExec $db 'COMMIT'
+                    $transactionOpen = $false
+                    AxRef-SqliteExec $db 'BEGIN'
+                    $transactionOpen = $true
+                }
+            }
+            if ($transactionOpen) {
+                AxRef-SqliteExec $db 'COMMIT'
+                $transactionOpen = $false
+            }
+        }
+    }
+    catch {
+        $isPipelineStop = ($_.Exception -is [System.Management.Automation.PipelineStoppedException] -or $_.FullyQualifiedErrorId -match 'PipelineStopped')
+        if ($transactionOpen) {
+            if ($isPipelineStop) { AxRef-SqliteExec $db 'COMMIT' }
+            else { AxRef-SqliteExec $db 'ROLLBACK' }
+            $transactionOpen = $false
+        }
+        if ($isPipelineStop) { $cancelled = $true }
+        else { throw }
+    }
+    finally {
+        if ($transactionOpen) {
+            AxRef-SqliteExec $db 'COMMIT'
+        }
+        if ($statements) { AxRef-SqliteDisposeStatements $statements }
+        [void][AxRefSqliteNative]::Close($db)
+        Write-Progress -Activity $act -Completed
     }
 
-    if ($parsed -gt 0 -or $old.Count -ne $new.Count) {
-        Write-Progress -Activity $act -Status 'Saving index cache...' -PercentComplete 100
-        AxRef-WriteCache $cacheFile $new
+    return [pscustomobject]@{
+        Entries = $new; Hits = $hits; HitTexts = $hitTexts; Parsed = $parsed
+        Canceled = $cancelled; IndexPath = $dbFile; IndexedFiles = $new.Count
     }
-    Write-Progress -Activity $act -Completed
-    return [pscustomobject]@{ Entries = $new; Hits = $hits; HitTexts = $hitTexts; Parsed = $parsed }
 }
 
 # merges TOP and CUS entries into one model (CUS methods win)
-function AxRef-BuildModel($entries) {
+function AxRef-BuildModel($entries, [string]$cusObjectPrefix = '', [string]$indexPath = '') {
     $model = [pscustomobject]@{
         Elems   = (New-Object System.Collections.Generic.List[object])
         ByKey   = @{}
         ByName  = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
         Methods = (New-Object System.Collections.Generic.List[object])
-        # Reverse indexes: populated once after TOP/CUS merging.
-        CallersByMethodName = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        ReferencesByName    = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        DeclRefsByName      = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        IndexPath = $indexPath
+        CusObjectPrefix = $cusObjectPrefix
     }
+    $cusKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($cusObjectPrefix) {
+        foreach ($e in $entries.Values) {
+            if ($e.Layer -eq 'cus') { [void]$cusKeys.Add(($e.Type + '|' + $e.Name)) }
+        }
+    }
+    $topPrefixWithoutCus = New-Object System.Collections.Generic.List[string]
     $act = 'Building object model'
     $done = 0; $all = $entries.Count
     foreach ($layer in @('top', 'cus')) {
         foreach ($e in $entries.Values) {
             if ($e.Layer -ne $layer) { continue }
+            $key = ($e.Type + '|' + $e.Name).ToLowerInvariant()
+            if ($layer -eq 'top' -and $cusObjectPrefix -and $e.Name.StartsWith($cusObjectPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                if ($cusKeys.Contains(($e.Type + '|' + $e.Name))) { continue }
+                $topPrefixWithoutCus.Add($e.Type + '\' + $e.Name)
+            }
             $done++
             if (($done % 500) -eq 0) {
                 Write-Progress -Activity $act -Status ('{0} / {1}' -f $done, $all) -PercentComplete ([int](100 * $done / [Math]::Max(1, $all)))
             }
-            $key = ($e.Type + '|' + $e.Name).ToLowerInvariant()
             $el = $model.ByKey[$key]
             if (-not $el) {
                 $el = [pscustomobject]@{
                     Key = $key; Type = $e.Type; Name = $e.Name; TopPath = $null; CusPath = $null
-                    DeclRefs = ','; Methods = @{}; MethodsByName = @{}; Noise = $script:AxRefNoise.Contains($e.Name)
+                    DeclRefs = ','; DeclRefsLayer = $null
+                    Methods = @{}; MethodsByName = @{}; Noise = $script:AxRefNoise.Contains($e.Name)
                 }
                 $model.ByKey[$key] = $el
                 $model.Elems.Add($el)
@@ -458,13 +863,13 @@ function AxRef-BuildModel($entries) {
                 }
             }
             if ($layer -eq 'top') { $el.TopPath = $e.Path } else { $el.CusPath = $e.Path }
-            if ($e.DeclRefs.Length -gt 1) { $el.DeclRefs = $e.DeclRefs }
+            if ($e.DeclRefs.Length -gt 1) { $el.DeclRefs = $e.DeclRefs; $el.DeclRefsLayer = $layer }
             foreach ($m in $e.Methods) {
                 $mk = AxRef-MKey $m.Owner $m.Name
                 $mo = $el.Methods[$mk]
-                if ($mo) { $mo.Calls = $m.Calls; $mo.Refs = $m.Refs }
+                if ($mo) { $mo.Calls = $m.Calls; $mo.Refs = $m.Refs; $mo.SourceLayer = $layer }
                 else {
-                    $mo = [pscustomobject]@{ Elem = $el; Owner = $m.Owner; Name = $m.Name; Key = $mk; Calls = $m.Calls; Refs = $m.Refs }
+                    $mo = [pscustomobject]@{ Elem = $el; Owner = $m.Owner; Name = $m.Name; Key = $mk; Calls = $m.Calls; Refs = $m.Refs; SourceLayer = $layer }
                     $el.Methods[$mk] = $mo
                     $methodName = $m.Name.ToLowerInvariant()
                     if (-not $el.MethodsByName.ContainsKey($methodName)) {
@@ -476,45 +881,17 @@ function AxRef-BuildModel($entries) {
             }
         }
     }
-    # Build reverse indexes once. Caller expansion can then retrieve only
-    # methods/objects that actually mention a requested method/object name.
-    foreach ($x in $model.Methods) {
-        foreach ($token in $x.Calls.Split(',')) {
-            $token = $token.Trim()
-            if (-not $token) { continue }
-            if (-not $model.CallersByMethodName.ContainsKey($token)) {
-                $model.CallersByMethodName[$token] = New-Object System.Collections.Generic.List[object]
-            }
-            $model.CallersByMethodName[$token].Add($x)
-        }
-        foreach ($token in $x.Refs.Split(',')) {
-            $token = $token.Trim()
-            if (-not $token) { continue }
-            if (-not $model.ReferencesByName.ContainsKey($token)) {
-                $model.ReferencesByName[$token] = New-Object System.Collections.Generic.List[object]
-            }
-            $model.ReferencesByName[$token].Add($x)
-        }
-    }
-    foreach ($el in $model.Elems) {
-        foreach ($token in $el.DeclRefs.Split(',')) {
-            $token = $token.Trim()
-            if (-not $token) { continue }
-            if (-not $model.DeclRefsByName.ContainsKey($token)) {
-                $model.DeclRefsByName[$token] = New-Object System.Collections.Generic.List[object]
-            }
-            $model.DeclRefsByName[$token].Add($el)
-        }
-    }
-
     Write-Progress -Activity $act -Completed
+    if ($topPrefixWithoutCus.Count -gt 0) {
+        Write-Warning ("CUS object prefix '{0}' matched TOP object(s) without a CUS counterpart; kept their existing TOP behavior: {1}" -f $cusObjectPrefix, (($topPrefixWithoutCus | Sort-Object -Unique) -join ', '))
+    }
     return $model
 }
 
 # ===========================================================================
 #  keyword hits -> methods / elements
 # ===========================================================================
-function AxRef-FindHits($model, $entries, [string[]]$keywords, $hitTexts) {
+function AxRef-FindHits($model, $entries, [string[]]$keywords, $hitTexts, [string]$cusObjectPrefix = '') {
     $hitMethods = New-Object System.Collections.Generic.List[object]
     $hitElems   = New-Object System.Collections.Generic.List[object]
     $seen = New-Object System.Collections.Generic.HashSet[string]
@@ -532,6 +909,7 @@ function AxRef-FindHits($model, $entries, [string[]]$keywords, $hitTexts) {
         }
         $el = $model.ByKey[($e.Type + '|' + $e.Name).ToLowerInvariant()]
         if (-not $el) { continue }
+        if ($e.Layer -eq 'top' -and $el.CusPath -and $cusObjectPrefix -and $e.Name.StartsWith($cusObjectPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
         $ck = $e.Layer + '|' + $e.Rel
         if ($hitTexts.ContainsKey($ck)) { $text = $hitTexts[$ck] }
         else { $text = [System.IO.File]::ReadAllText($e.Path) }
@@ -589,51 +967,63 @@ function AxRef-FindCallers($model, $frontier) {
         elseif (-not $f.Elem.Noise) { [void]$elemOnly.Add($f.Elem.Name) }
     }
 
-    # Method callers: inspect only methods indexed as calling one of the
-    # frontier method names, rather than scanning every method in the model.
-    foreach ($methodName in $byName.Keys) {
-        if (-not $model.CallersByMethodName.ContainsKey($methodName)) { continue }
-        $candidates = $model.CallersByMethodName[$methodName]
-        foreach ($x in $candidates) {
-            foreach ($f in $byName[$methodName]) {
-                if ([object]::ReferenceEquals($x, $f.Method)) { continue }
-                $ok = [object]::ReferenceEquals($x.Elem, $f.Elem)
-                if (-not $ok -and -not $f.Elem.Noise) {
-                    $probe = ',' + $f.Elem.Name + ','
-                    $ok = ($x.Refs.Contains($probe) -or $x.Elem.DeclRefs.Contains($probe))
+    $db = AxRef-SqliteOpen $model.IndexPath
+    $statement = [IntPtr]::Zero
+    try {
+        $statement = AxRef-SqlitePrepare $db 'SELECT e.source_layer,f.type,f.name,e.source_owner,e.source_method
+FROM Edges e JOIN Files f ON f.layer=e.source_layer AND f.rel=e.source_rel
+WHERE e.target=?1 COLLATE NOCASE AND e.kind=?2'
+
+        foreach ($methodName in $byName.Keys) {
+            $candidates = AxRef-SqliteReadEdgeSources $statement $methodName 'call'
+            foreach ($source in $candidates) {
+                $elemKey = ($source.Type + '|' + $source.Name).ToLowerInvariant()
+                $elem = $model.ByKey[$elemKey]
+                if (-not $elem) { continue }
+                $methodKey = AxRef-MKey $source.Owner $source.Method
+                $x = $elem.Methods[$methodKey]
+                if (-not $x -or $x.SourceLayer -ne $source.Layer) { continue }
+                foreach ($f in $byName[$methodName]) {
+                    if ([object]::ReferenceEquals($x, $f.Method)) { continue }
+                    $ok = [object]::ReferenceEquals($x.Elem, $f.Elem)
+                    if (-not $ok -and -not $f.Elem.Noise) {
+                        $probe = ',' + $f.Elem.Name + ','
+                        $ok = ($x.Refs.Contains($probe) -or $x.Elem.DeclRefs.Contains($probe))
+                    }
+                    if ($ok -and $seen.Add($x.Elem.Key + '|' + $x.Key)) {
+                        $res.Add([pscustomobject]@{ Elem = $x.Elem; Method = $x })
+                    }
                 }
-                if ($ok -and $seen.Add($x.Elem.Key + '|' + $x.Key)) {
+            }
+        }
+
+        foreach ($elementName in $elemOnly) {
+            $methodCandidates = AxRef-SqliteReadEdgeSources $statement $elementName 'ref'
+            foreach ($source in $methodCandidates) {
+                $elemKey = ($source.Type + '|' + $source.Name).ToLowerInvariant()
+                $elem = $model.ByKey[$elemKey]
+                if (-not $elem) { continue }
+                $methodKey = AxRef-MKey $source.Owner $source.Method
+                $x = $elem.Methods[$methodKey]
+                if ($x -and $x.SourceLayer -eq $source.Layer -and $seen.Add($x.Elem.Key + '|' + $x.Key)) {
                     $res.Add([pscustomobject]@{ Elem = $x.Elem; Method = $x })
+                }
+            }
+
+            $elementCandidates = AxRef-SqliteReadEdgeSources $statement $elementName 'decl'
+            foreach ($source in $elementCandidates) {
+                $elemKey = ($source.Type + '|' + $source.Name).ToLowerInvariant()
+                $elem = $model.ByKey[$elemKey]
+                if (-not $elem -or $elem.DeclRefsLayer -ne $source.Layer) { continue }
+                if ($seen.Add($elem.Key + '|')) {
+                    $res.Add([pscustomobject]@{ Elem = $elem; Method = $null })
                 }
             }
         }
     }
-
-    # Whole-element targets: use reverse object-reference indexes. No full
-    # scan of model.Methods or model.Elems is needed at each caller level.
-    foreach ($elementName in $elemOnly) {
-        $methodCandidates = $null
-        if ($model.ReferencesByName.ContainsKey($elementName)) {
-            $methodCandidates = $model.ReferencesByName[$elementName]
-        }
-        if ($methodCandidates) {
-            foreach ($x in $methodCandidates) {
-                if ($seen.Add($x.Elem.Key + '|' + $x.Key)) {
-                    $res.Add([pscustomobject]@{ Elem = $x.Elem; Method = $x })
-                }
-            }
-        }
-        $elementCandidates = $null
-        if ($model.DeclRefsByName.ContainsKey($elementName)) {
-            $elementCandidates = $model.DeclRefsByName[$elementName]
-        }
-        if ($elementCandidates) {
-            foreach ($el in $elementCandidates) {
-                if ($seen.Add($el.Key + '|')) {
-                    $res.Add([pscustomobject]@{ Elem = $el; Method = $null })
-                }
-            }
-        }
+    finally {
+        if ($statement -ne [IntPtr]::Zero) { [void][AxRefSqliteNative]::Finalize($statement) }
+        [void][AxRefSqliteNative]::Close($db)
     }
     return , $res
 }
@@ -897,6 +1287,8 @@ function AxRef-WriteDocs([string]$out, $info, $sel, $roles, $fileMap) {
     $kw = ($info.Keywords | ForEach-Object { '`' + $_ + '`' }) -join ', '
     $nameFilters = ($info.ObjectNameContains | ForEach-Object { '`' + $_ + '`' }) -join ', '
     if (-not $nameFilters) { $nameFilters = '(none)' }
+    $cusObjectPrefix = '(none)'
+    if ($info.CusObjectPrefix) { $cusObjectPrefix = '`' + $info.CusObjectPrefix + '`' }
     $manifestRows = @{}
     $manifestPath = Join-Path $out 'MANIFEST.md'
     if (Test-Path $manifestPath) {
@@ -919,6 +1311,7 @@ function AxRef-WriteDocs([string]$out, $info, $sel, $roles, $fileMap) {
     [void]$mf.AppendLine('')
     [void]$mf.AppendLine("Keywords: $kw  ")
     [void]$mf.AppendLine("Object-name fragments: $nameFilters  ")
+    [void]$mf.AppendLine("CUS-only object prefix: $cusObjectPrefix  ")
     [void]$mf.AppendLine("Caller depth: $($info.CallerDepth), called depth: $($info.CalledDepth)  ")
     [void]$mf.AppendLine("Generated: $($info.When)")
     [void]$mf.AppendLine('')
@@ -953,6 +1346,7 @@ This folder is a **sanitized reference set** extracted from a Microsoft Dynamics
 
 - Keywords: {{KEYWORDS}}
 - Object-name fragments: {{OBJECTNAMEFRAGMENTS}}
+- CUS-only object prefix: {{CUSOBJECTPREFIX}}
 - Caller depth: {{CALLERDEPTH}}  /  called depth: {{CALLEDDEPTH}}
 - Objects included: {{COUNT}} (see `MANIFEST.md` for every object and why it is here)
 
@@ -1024,6 +1418,7 @@ Static text analysis, so treat it as a good guide, not a guarantee:
 '@
 
     $doc = $doc.Replace('{{KEYWORDS}}', $kw).Replace('{{OBJECTNAMEFRAGMENTS}}', $nameFilters)
+    $doc = $doc.Replace('{{CUSOBJECTPREFIX}}', $cusObjectPrefix)
     $doc = $doc.Replace('{{CALLERDEPTH}}', [string]$info.CallerDepth).Replace('{{CALLEDDEPTH}}', [string]$info.CalledDepth)
     $doc = $doc.Replace('{{COUNT}}', [string]$manifestRows.Count).Replace('{{PROJECT}}', $projText)
     [System.IO.File]::WriteAllText((Join-Path $out 'AGENTS.md'), $doc, (New-Object System.Text.UTF8Encoding($false)))
@@ -1046,6 +1441,8 @@ function Export-AxReference {
         [string]$CusFolder,
         [string[]]$Keyword,
         [string[]]$ObjectNameContains,
+        [string]$CusObjectPrefix,
+        [switch]$BuildIndex,
         [int]$CallerDepth = -1,
         [int]$CalledDepth = -1,
         [int]$MaxObjects = 400,
@@ -1075,6 +1472,18 @@ function Export-AxReference {
     New-Item -ItemType Directory -Force -Path $script:AxRefDir | Out-Null
     ([pscustomobject]@{ Top = $TopFolder; Cus = $CusFolder } | ConvertTo-Json) | Set-Content -Path $lastFile -Encoding UTF8
 
+    if ($BuildIndex) {
+        Write-Host 'Building/updating the SQLite reference index. Press Ctrl+C to stop; completed batches are retained.'
+        $noKeywords = [string[]]@()
+        $ix = AxRef-BuildIndex $topRoot $cusRoot $noKeywords ([bool]$RebuildIndex) $true
+        if ($ix.Canceled) { Write-Warning ("Index build stopped. Completed work is saved in '{0}' and will resume on the next run." -f $ix.IndexPath) }
+        else {
+            Write-Host ("Index ready: {0} files; parsed this run: {1}." -f $ix.IndexedFiles, $ix.Parsed)
+            Write-Host ("Stored at {0}" -f $ix.IndexPath)
+        }
+        return
+    }
+
     # keywords
     $kws = New-Object System.Collections.Generic.List[string]
     if ($Keyword) { foreach ($k in $Keyword) { if ($k.Trim()) { $kws.Add($k.Trim()) } } }
@@ -1102,6 +1511,10 @@ function Export-AxReference {
             $nameFilters.Add($name.Trim())
         }
     }
+    if (-not $PSBoundParameters.ContainsKey('CusObjectPrefix')) {
+        $CusObjectPrefix = Read-Host 'Optional CUS-only object prefix (blank keeps normal TOP/CUS handling)'
+        if ($CusObjectPrefix) { $CusObjectPrefix = $CusObjectPrefix.Trim() }
+    }
     if ($kws.Count -eq 0 -and $nameFilters.Count -eq 0) {
         Write-Warning 'Enter at least one keyword or object-name fragment.'
         return
@@ -1117,13 +1530,18 @@ function Export-AxReference {
     }
 
     # ---- index + hits
-    Write-Host 'Reading and indexing XPO files (first run is slow, later runs reuse the cache)...'
+    Write-Host 'Reading and updating the SQLite XPO index (unchanged files reuse the cache)...'
     $ix = AxRef-BuildIndex $topRoot $cusRoot $kws.ToArray() ([bool]$RebuildIndex)
+    if ($ix.Canceled) {
+        Write-Warning ("Index update stopped. Completed work is saved in '{0}'. Rerun axref to resume." -f $ix.IndexPath)
+        return
+    }
+    Write-Host ('SQLite index: ' + $ix.IndexPath)
     Write-Host ('Files: ' + $ix.Entries.Count + ', (re)parsed this run: ' + $ix.Parsed + ', files containing a keyword: ' + $ix.Hits.Count)
-    $model = AxRef-BuildModel $ix.Entries
+    $model = AxRef-BuildModel $ix.Entries $CusObjectPrefix $ix.IndexPath
     Write-Host ('Objects: ' + $model.Elems.Count + ', methods: ' + $model.Methods.Count)
 
-    $hits = AxRef-FindHits $model $ix.Hits $kws.ToArray() $ix.HitTexts
+    $hits = AxRef-FindHits $model $ix.Hits $kws.ToArray() $ix.HitTexts $CusObjectPrefix
     $targets = New-Object System.Collections.Generic.List[object]
     foreach ($el in $model.Elems) {
         foreach ($name in $nameFilters) {
@@ -1276,7 +1694,7 @@ function Export-AxReference {
     }
 
     $info = [pscustomobject]@{
-        Keywords = $kws.ToArray(); ObjectNameContains = $nameFilters.ToArray()
+        Keywords = $kws.ToArray(); ObjectNameContains = $nameFilters.ToArray(); CusObjectPrefix = $CusObjectPrefix
         CallerDepth = $CallerDepth; CalledDepth = $CalledDepth
         When = (Get-Date).ToString('yyyy-MM-dd HH:mm'); ProjectFile = $projectFile
     }

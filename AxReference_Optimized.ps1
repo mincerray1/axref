@@ -6,6 +6,8 @@
 #
 #       axref                       (asks everything interactively)
 #       axref -TopFolder top -CusFolder cus -Keyword SalesLineGrouping -CallerDepth 4
+#       axref -Keyword validateWrite -ObjectNameContains PurchAgree,SalesLine
+#       axref -ObjectNameContains PurchAgree
 #
 #  Works on Windows PowerShell 5.1 and PowerShell 7.
 # ============================================================================
@@ -294,6 +296,9 @@ function AxRef-WriteCache([string]$file, $map) {
 }
 
 function AxRef-GetKeywordHitPaths([string[]]$roots, [string[]]$keywords) {
+    if ($keywords.Count -eq 0) {
+        return , ([System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase))
+    }
     if (-not $script:AxRefRg) { return $null }
 
     $rgArgs = @('--files-with-matches', '--null', '--ignore-case', '--fixed-strings',
@@ -890,16 +895,19 @@ function AxRef-WriteProject($tpl, [string]$projectName, $elements, [string]$path
 # ===========================================================================
 function AxRef-WriteDocs([string]$out, $info, $sel, $roles, $fileMap) {
     $kw = ($info.Keywords | ForEach-Object { '`' + $_ + '`' }) -join ', '
+    $nameFilters = ($info.ObjectNameContains | ForEach-Object { '`' + $_ + '`' }) -join ', '
+    if (-not $nameFilters) { $nameFilters = '(none)' }
 
     # ---- manifest
     $mf = New-Object System.Text.StringBuilder
     [void]$mf.AppendLine('# Manifest')
     [void]$mf.AppendLine('')
     [void]$mf.AppendLine("Keywords: $kw  ")
+    [void]$mf.AppendLine("Object-name fragments: $nameFilters  ")
     [void]$mf.AppendLine("Caller depth: $($info.CallerDepth), called depth: $($info.CalledDepth)  ")
     [void]$mf.AppendLine("Generated: $($info.When)")
     [void]$mf.AppendLine('')
-    [void]$mf.AppendLine('Roles: `match` = keyword found in the object, `target` = object name equals a keyword, `caller Ln` = n levels up (L1 = the method containing the keyword), `called Ln` = n levels down.')
+    [void]$mf.AppendLine('Roles: `match` = keyword found in the object, `target` = object name contains a requested name fragment, `caller Ln` = n levels up (L1 = the method containing the keyword), `called Ln` = n levels down.')
     [void]$mf.AppendLine('')
     [void]$mf.AppendLine('| Type | Object | Files | Roles |')
     [void]$mf.AppendLine('|---|---|---|---|')
@@ -924,6 +932,7 @@ This folder is a **sanitized reference set** extracted from a Microsoft Dynamics
 ## What was searched
 
 - Keywords: {{KEYWORDS}}
+- Object-name fragments: {{OBJECTNAMEFRAGMENTS}}
 - Caller depth: {{CALLERDEPTH}}  /  called depth: {{CALLEDDEPTH}}
 - Objects included: {{COUNT}} (see `MANIFEST.md` for every object and why it is here)
 
@@ -985,11 +994,26 @@ Static text analysis, so treat it as a good guide, not a guarantee:
 - Prefer the smallest possible change and say which layer and object/method it goes in.
 - When proposing code, give the complete method, in X++ 2012 style (no features newer than AX 2012 R3).
 - If an object is missing from this folder, say so instead of guessing what it contains.
+
+## When asked for help with a feature or bug
+
+- Create or update a root-level `recommendation.md` with the proposed code changes. Show the relevant before and after code, a syntax-highlighted `diff` block, and complete copy/pasteable X++ code.
+- Explain the change and recommendation, list possible risks or assumptions, and provide logic checks or test scenarios to validate the behavior.
+- Ask whether more context is needed. If an object's behavior or a keyword is unclear, name the specific object or keyword that needs a definition instead of guessing.
+- If asked for a technical design document, create a separate root-level `TDD.md`. Keep both `recommendation.md` and `TDD.md` available to Git.
 '@
 
-    $doc = $doc.Replace('{{KEYWORDS}}', $kw).Replace('{{CALLERDEPTH}}', [string]$info.CallerDepth).Replace('{{CALLEDDEPTH}}', [string]$info.CalledDepth)
+    $doc = $doc.Replace('{{KEYWORDS}}', $kw).Replace('{{OBJECTNAMEFRAGMENTS}}', $nameFilters)
+    $doc = $doc.Replace('{{CALLERDEPTH}}', [string]$info.CallerDepth).Replace('{{CALLEDDEPTH}}', [string]$info.CalledDepth)
     $doc = $doc.Replace('{{COUNT}}', [string]$sel.Count).Replace('{{PROJECT}}', $projText)
     [System.IO.File]::WriteAllText((Join-Path $out 'AGENTS.md'), $doc, (New-Object System.Text.UTF8Encoding($false)))
+
+    $gitignore = @'
+# Generated X++ reference files. Git omits their folders when they contain no other files.
+*.xpp
+# Keep recommendation.md, TDD.md, and other Markdown documents trackable.
+'@
+    [System.IO.File]::WriteAllText((Join-Path $out '.gitignore'), $gitignore, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 # ===========================================================================
@@ -1001,6 +1025,7 @@ function Export-AxReference {
         [string]$TopFolder,
         [string]$CusFolder,
         [string[]]$Keyword,
+        [string[]]$ObjectNameContains,
         [int]$CallerDepth = -1,
         [int]$CalledDepth = -1,
         [int]$MaxObjects = 400,
@@ -1033,17 +1058,33 @@ function Export-AxReference {
     # keywords
     $kws = New-Object System.Collections.Generic.List[string]
     if ($Keyword) { foreach ($k in $Keyword) { if ($k.Trim()) { $kws.Add($k.Trim()) } } }
-    if ($kws.Count -eq 0) {
-        Write-Host 'Enter keywords one at a time. Press Enter on an empty line (or type /done) when finished.'
+    $nameFilters = New-Object System.Collections.Generic.List[string]
+    if ($ObjectNameContains) {
+        foreach ($name in $ObjectNameContains) {
+            if (-not [string]::IsNullOrWhiteSpace($name)) { $nameFilters.Add($name.Trim()) }
+        }
+    }
+    if ($kws.Count -eq 0 -and $nameFilters.Count -eq 0) {
+        Write-Host 'Enter keywords one at a time. Press Enter on an empty line to finish keyword entry.'
         while ($true) {
             $k = Read-Host ('Keyword #' + ($kws.Count + 1))
-            if ([string]::IsNullOrWhiteSpace($k) -or $k.Trim() -eq '/done') {
-                if ($kws.Count -gt 0) { break }
-                Write-Host 'Enter at least one keyword.'
-                continue
-            }
+            if ([string]::IsNullOrWhiteSpace($k)) { break }
             $kws.Add($k.Trim())
         }
+    }
+
+    # optional object-name fragments
+    if ($nameFilters.Count -eq 0) {
+        Write-Host 'Optional: enter object-name fragments to include matching objects (case-insensitive substring). Press Enter on an empty line to finish.'
+        while ($true) {
+            $name = Read-Host ('Object name fragment #' + ($nameFilters.Count + 1))
+            if ([string]::IsNullOrWhiteSpace($name)) { break }
+            $nameFilters.Add($name.Trim())
+        }
+    }
+    if ($kws.Count -eq 0 -and $nameFilters.Count -eq 0) {
+        Write-Warning 'Enter at least one keyword or object-name fragment.'
+        return
     }
 
     if ($CallerDepth -lt 0) { $CallerDepth = [int](AxRef-Ask 'Caller depth (levels up)' '5') }
@@ -1067,13 +1108,18 @@ function Export-AxReference {
     $hits = AxRef-FindHits $model $ix.Hits $kws.ToArray() $ix.HitTexts
     $targets = New-Object System.Collections.Generic.List[object]
     foreach ($el in $model.Elems) {
-        foreach ($k in $kws) { if ($el.Name -ieq $k) { $targets.Add($el); break } }
+        foreach ($name in $nameFilters) {
+            if ($el.Name.IndexOf($name, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $targets.Add($el)
+                break
+            }
+        }
     }
     if ($hits.Methods.Count -eq 0 -and $hits.Elems.Count -eq 0 -and $targets.Count -eq 0) {
-        Write-Warning 'Nothing matched those keywords.'
+        Write-Warning 'Nothing matched the keywords or object-name fragments.'
         return
     }
-    Write-Host ('Keyword hits: ' + $hits.Methods.Count + ' methods, ' + $hits.Elems.Count + ' other places, ' + $targets.Count + ' objects named like a keyword')
+    Write-Host ('Keyword hits: ' + $hits.Methods.Count + ' methods, ' + $hits.Elems.Count + ' other places; object-name hits: ' + $targets.Count + ' objects')
 
     $sel = @{}; $roles = @{}
     foreach ($m in $hits.Methods) {
@@ -1188,7 +1234,8 @@ function Export-AxReference {
     }
 
     $info = [pscustomobject]@{
-        Keywords = $kws.ToArray(); CallerDepth = $CallerDepth; CalledDepth = $CalledDepth
+        Keywords = $kws.ToArray(); ObjectNameContains = $nameFilters.ToArray()
+        CallerDepth = $CallerDepth; CalledDepth = $CalledDepth
         When = (Get-Date).ToString('yyyy-MM-dd HH:mm'); ProjectFile = $projectFile
     }
     AxRef-WriteDocs $out $info $sel $roles $fileMap

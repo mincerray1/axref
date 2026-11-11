@@ -349,6 +349,18 @@ function AxRef-SqliteRun($statement) {
     [void][AxRefSqliteNative]::ClearBindings($statement)
 }
 
+function AxRef-FormatProgressStatus([string]$label, [int64]$current, [int64]$total, $stopwatch) {
+    $elapsed = [System.TimeSpan]::FromMilliseconds($stopwatch.ElapsedMilliseconds)
+    if ($current -gt 0 -and $total -gt $current) {
+        $remaining = [System.TimeSpan]::FromMilliseconds($stopwatch.ElapsedMilliseconds / $current * ($total - $current))
+        $remainingText = ('{0:00}:{1:00}:{2:00}' -f [Math]::Floor($remaining.TotalHours), $remaining.Minutes, $remaining.Seconds)
+    }
+    elseif ($total -gt 0 -and $current -ge $total) { $remainingText = '00:00:00' }
+    else { $remainingText = 'estimating' }
+    $elapsedText = '{0:00}:{1:00}:{2:00}' -f [Math]::Floor($elapsed.TotalHours), $elapsed.Minutes, $elapsed.Seconds
+    return ('{0}   elapsed {1}   remaining ~{2}' -f $label, $elapsedText, $remainingText)
+}
+
 function AxRef-SqliteColumnText($statement, [int]$column) {
     $p = [AxRefSqliteNative]::ColumnText($statement, $column)
     if ($p -eq [IntPtr]::Zero) { return '' }
@@ -459,6 +471,7 @@ function AxRef-SqliteLoadEntries($db, [string]$topRoot, [string]$cusRoot, [bool]
     }
     finally { [void][AxRefSqliteNative]::Finalize($countStatement) }
     $statement = AxRef-SqlitePrepare $db 'SELECT layer,rel,ticks,len,type,name,decl_refs FROM Files'
+    $fileLoadTimer = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $loaded = 0
         while (($rc = [AxRefSqliteNative]::Step($statement)) -eq 100) {
@@ -478,13 +491,13 @@ function AxRef-SqliteLoadEntries($db, [string]$topRoot, [string]$cusRoot, [bool]
             $entries[($layer + '|' + $rel)] = $entry
             if (($loaded % 1000) -eq 0 -or $loaded -eq $fileTotal) {
                 $pct = [int](100 * $loaded / [Math]::Max(1, $fileTotal))
-                Write-Progress -Activity 'Indexing XPO files' -Status ("Loading SQLite file index: {0} / {1}" -f $loaded, $fileTotal) -PercentComplete $pct
+                $status = AxRef-FormatProgressStatus ("Loading SQLite file index: {0} / {1}" -f $loaded, $fileTotal) $loaded $fileTotal $fileLoadTimer
+                Write-Progress -Activity 'Indexing XPO files' -Status $status -PercentComplete $pct
             }
         }
         if ($rc -ne 101) { throw "SQLite file read failed with code $rc" }
     }
     finally { [void][AxRefSqliteNative]::Finalize($statement) }
-
     if (-not $includeMethods) { return $entries }
     $countStatement = AxRef-SqlitePrepare $db 'SELECT count(*) FROM Methods'
     try {
@@ -494,6 +507,7 @@ function AxRef-SqliteLoadEntries($db, [string]$topRoot, [string]$cusRoot, [bool]
     }
     finally { [void][AxRefSqliteNative]::Finalize($countStatement) }
     $statement = AxRef-SqlitePrepare $db 'SELECT layer,rel,owner,name,calls,refs FROM Methods'
+    $methodLoadTimer = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $loadedMethods = 0
         while (($rc = [AxRefSqliteNative]::Step($statement)) -eq 100) {
@@ -509,7 +523,8 @@ function AxRef-SqliteLoadEntries($db, [string]$topRoot, [string]$cusRoot, [bool]
             }
             if (($loadedMethods % 5000) -eq 0 -or $loadedMethods -eq $methodTotal) {
                 $pct = [int](100 * $loadedMethods / [Math]::Max(1, $methodTotal))
-                Write-Progress -Activity 'Indexing XPO files' -Status ("Loading SQLite method index: {0} / {1}" -f $loadedMethods, $methodTotal) -PercentComplete $pct
+                $status = AxRef-FormatProgressStatus ("Loading SQLite method index: {0} / {1}" -f $loadedMethods, $methodTotal) $loadedMethods $methodTotal $methodLoadTimer
+                Write-Progress -Activity 'Indexing XPO files' -Status $status -PercentComplete $pct
             }
         }
         if ($rc -ne 101) { throw "SQLite method read failed with code $rc" }
@@ -626,6 +641,7 @@ function AxRef-BuildIndex([string]$topRoot, [string]$cusRoot, [string[]]$keyword
     $hits = New-Object System.Collections.Generic.List[object]
     $hitTexts = @{}
     $parsed = 0
+    $buildTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $i = 0
     $total = 0
     try {
@@ -637,6 +653,7 @@ function AxRef-BuildIndex([string]$topRoot, [string]$cusRoot, [string[]]$keyword
                 $legacy = AxRef-ReadCache $legacyFile
                 $legacyCount = $legacy.Count
                 $migrated = 0
+                $migrationTimer = [System.Diagnostics.Stopwatch]::StartNew()
                 if ($legacyCount -gt 0) {
                     AxRef-SqliteExec $db 'BEGIN'
                     $transactionOpen = $true
@@ -647,7 +664,8 @@ function AxRef-BuildIndex([string]$topRoot, [string]$cusRoot, [string[]]$keyword
                             AxRef-SqliteExec $db 'COMMIT'
                             $transactionOpen = $false
                             $pct = [int](100 * $migrated / $legacyCount)
-                            Write-Progress -Activity $act -Status ("Importing existing TSV cache: {0} / {1}" -f $migrated, $legacyCount) -PercentComplete $pct
+                            $status = AxRef-FormatProgressStatus ("Importing existing TSV cache: {0} / {1}" -f $migrated, $legacyCount) $migrated $legacyCount $migrationTimer
+                            Write-Progress -Activity $act -Status $status -PercentComplete $pct
                             AxRef-SqliteExec $db 'BEGIN'
                             $transactionOpen = $true
                         }
@@ -665,18 +683,22 @@ function AxRef-BuildIndex([string]$topRoot, [string]$cusRoot, [string[]]$keyword
         Write-Progress -Activity $act -Status 'Counting XPO files...' -PercentComplete 0
         $work = New-Object System.Collections.Generic.List[object]
         $counted = 0
+        $countTimer = [System.Diagnostics.Stopwatch]::StartNew()
         foreach ($pair in @(@('top', $topRoot), @('cus', $cusRoot))) {
             $di = New-Object System.IO.DirectoryInfo($pair[1])
             foreach ($fi in $di.EnumerateFiles('*.xpo', [System.IO.SearchOption]::AllDirectories)) {
                 $work.Add([pscustomobject]@{ Layer = $pair[0]; Root = $pair[1]; File = $fi })
                 $counted++
                 if (($counted % 1000) -eq 0) {
-                    Write-Progress -Activity $act -Status ("Counting XPO files: {0} found..." -f $counted) -PercentComplete 0
+                    $status = AxRef-FormatProgressStatus ("Counting XPO files: {0} found..." -f $counted) $counted 0 $countTimer
+                    Write-Progress -Activity $act -Status $status -PercentComplete 0
                 }
             }
         }
         $total = $work.Count
         Write-Host ("Found {0} XPO files." -f $total)
+        $status = AxRef-FormatProgressStatus ("Finished counting {0} XPO files" -f $total) $total $total $countTimer
+        Write-Progress -Activity $act -Status $status -PercentComplete 0
 
         $hitPaths = AxRef-GetKeywordHitPaths @($topRoot, $cusRoot) $keywords
         if ($null -ne $hitPaths -and $keywords.Count -gt 0) {
@@ -696,9 +718,8 @@ function AxRef-BuildIndex([string]$topRoot, [string]$cusRoot, [string[]]$keyword
                 if (($sw.ElapsedMilliseconds - $lastUi) -ge 250 -or $i -eq $total) {
                     $lastUi = $sw.ElapsedMilliseconds
                     $pct = [int](100 * $i / [Math]::Max(1, $total))
-                    $eta = [System.TimeSpan]::FromMilliseconds($sw.ElapsedMilliseconds / [Math]::Max(1, $i) * ($total - $i))
-                    $status = ('{0} / {1} ({2}%)   elapsed {3}   remaining ~{4}   re-parsed {5}   keyword hits {6}' -f `
-                        $i, $total, $pct, $sw.Elapsed.ToString('hh\:mm\:ss'), $eta.ToString('hh\:mm\:ss'), $parsed, $hits.Count)
+                    $status = AxRef-FormatProgressStatus ("{0} / {1} ({2}%)   re-parsed {3}   keyword hits {4}" -f `
+                        $i, $total, $pct, $parsed, $hits.Count) $i $total $sw
                     Write-Progress -Activity $act -Status $status -PercentComplete $pct -CurrentOperation ($layer + ': ' + $fi.Name)
                 }
 
@@ -812,6 +833,7 @@ function AxRef-BuildIndex([string]$topRoot, [string]$cusRoot, [string[]]$keyword
     return [pscustomobject]@{
         Entries = $new; Hits = $hits; HitTexts = $hitTexts; Parsed = $parsed
         Canceled = $cancelled; IndexPath = $dbFile; IndexedFiles = $new.Count
+        Elapsed = $buildTimer.Elapsed
     }
 }
 
@@ -833,6 +855,7 @@ function AxRef-BuildModel($entries, [string]$cusObjectPrefix = '', [string]$inde
     }
     $topPrefixWithoutCus = New-Object System.Collections.Generic.List[string]
     $act = 'Building object model'
+    $modelTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $done = 0; $all = $entries.Count
     foreach ($layer in @('top', 'cus')) {
         foreach ($e in $entries.Values) {
@@ -844,7 +867,9 @@ function AxRef-BuildModel($entries, [string]$cusObjectPrefix = '', [string]$inde
             }
             $done++
             if (($done % 500) -eq 0) {
-                Write-Progress -Activity $act -Status ('{0} / {1}' -f $done, $all) -PercentComplete ([int](100 * $done / [Math]::Max(1, $all)))
+                $pct = [int](100 * $done / [Math]::Max(1, $all))
+                $status = AxRef-FormatProgressStatus ('{0} / {1}' -f $done, $all) $done $all $modelTimer
+                Write-Progress -Activity $act -Status $status -PercentComplete $pct
             }
             $el = $model.ByKey[$key]
             if (-not $el) {

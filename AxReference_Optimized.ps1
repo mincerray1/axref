@@ -964,7 +964,8 @@ function AxRef-FindHits($model, $entries, [string[]]$keywords, $hitTexts, [strin
     return [pscustomobject]@{ Methods = $hitMethods; Elems = $hitElems }
 }
 
-function AxRef-Include($sel, $roles, $el, [string]$role) {
+function AxRef-Include($sel, $roles, $el, [string]$role, $includedTypes) {
+    if (-not $includedTypes.Contains($el.Type)) { return }
     if (-not $sel.ContainsKey($el.Key)) {
         $sel[$el.Key] = $el
         $roles[$el.Key] = New-Object System.Collections.Generic.List[string]
@@ -1053,7 +1054,7 @@ WHERE e.target=?1 COLLATE NOCASE AND e.kind=?2'
     return , $res
 }
 
-function AxRef-ExpandCalled($model, $seeds, [int]$depth, $sel, $roles, [int]$maxObjects) {
+function AxRef-ExpandCalled($model, $seeds, [int]$depth, $sel, $roles, [int]$maxObjects, $includedTypes) {
     $seen = New-Object System.Collections.Generic.HashSet[string]
     $frontier = New-Object System.Collections.Generic.List[object]
     foreach ($s in $seeds) {
@@ -1073,11 +1074,12 @@ function AxRef-ExpandCalled($model, $seeds, [int]$depth, $sel, $roles, [int]$max
                 if ($tok.Length -eq 0 -or -not $model.ByName.ContainsKey($tok)) { continue }
                 foreach ($r in $model.ByName[$tok]) {
                     if ($r.Noise -or [object]::ReferenceEquals($r, $f.Elem)) { continue }
+                    if (-not $includedTypes.Contains($r.Type)) { continue }
                     if ($sel.Count -ge $maxObjects -and -not $sel.ContainsKey($r.Key)) {
                         Write-Warning "Object limit ($maxObjects) reached while following 'called' links."
                         return
                     }
-                    AxRef-Include $sel $roles $r ('called L' + $lvl)
+                    AxRef-Include $sel $roles $r ('called L' + $lvl) $includedTypes
 
                     # specific methods of that object that this method calls
                     $matched = $false
@@ -1545,8 +1547,23 @@ function Export-AxReference {
         return
     }
 
-    if ($CallerDepth -lt 0) { $CallerDepth = [int](AxRef-Ask 'Caller depth (levels up)' '5') }
-    if ($CalledDepth -lt 0) { $CalledDepth = [int](AxRef-Ask 'Called depth (levels down)' '5') }
+    $includeJobs = (AxRef-Ask 'Include jobs? (y/N)' 'N') -match '^(y|yes)$'
+    $includeMenus = (AxRef-Ask 'Include menus? (y/N)' 'N') -match '^(y|yes)$'
+    $includeMenuItems = (AxRef-Ask 'Include menu items? (y/N)' 'N') -match '^(y|yes)$'
+    $includeExtendedDataTypes = (AxRef-Ask 'Include extended data types? (y/N)' 'N') -match '^(y|yes)$'
+    $includeSecurity = (AxRef-Ask 'Include security (roles, duties, privileges)? (y/N)' 'N') -match '^(y|yes)$'
+    $includedTypes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($type in $script:AxRefTypes) {
+        if ($type -eq 'Jobs' -and -not $includeJobs) { continue }
+        if ($type -eq 'Menus' -and -not $includeMenus) { continue }
+        if ($type.StartsWith('Menu Items\', [System.StringComparison]::OrdinalIgnoreCase) -and -not $includeMenuItems) { continue }
+        if ($type -eq 'Data Dictionary\Extended Data Types' -and -not $includeExtendedDataTypes) { continue }
+        if ($type.StartsWith('Security\', [System.StringComparison]::OrdinalIgnoreCase) -and -not $includeSecurity) { continue }
+        [void]$includedTypes.Add($type)
+    }
+
+    if ($CallerDepth -lt 0) { $CallerDepth = [int](AxRef-Ask 'Caller depth (levels up)' '4') }
+    if ($CalledDepth -lt 0) { $CalledDepth = [int](AxRef-Ask 'Called depth (levels down)' '4') }
 
     # output folder
     $out = Join-Path $cwd 'reference'
@@ -1584,30 +1601,36 @@ function Export-AxReference {
 
     $sel = @{}; $roles = @{}
     foreach ($m in $hits.Methods) {
-        AxRef-Include $sel $roles $m.Elem 'match'
-        AxRef-Include $sel $roles $m.Elem 'caller L1'
+        AxRef-Include $sel $roles $m.Elem 'match' $includedTypes
+        AxRef-Include $sel $roles $m.Elem 'caller L1' $includedTypes
     }
-    foreach ($el in $hits.Elems) { AxRef-Include $sel $roles $el 'match' }
-    foreach ($el in $targets)    { AxRef-Include $sel $roles $el 'target' }
+    foreach ($el in $hits.Elems) { AxRef-Include $sel $roles $el 'match' $includedTypes }
+    foreach ($el in $targets)    { AxRef-Include $sel $roles $el 'target' $includedTypes }
 
     # ---- callers (up)
     $maxPerLevel = 300
     $cSeen = New-Object System.Collections.Generic.HashSet[string]
     $frontier = New-Object System.Collections.Generic.List[object]
     foreach ($m in $hits.Methods) {
+        if (-not $includedTypes.Contains($m.Elem.Type)) { continue }
         if ($cSeen.Add($m.Elem.Key + '|' + $m.Key)) { $frontier.Add([pscustomobject]@{ Elem = $m.Elem; Method = $m }) }
     }
     # Add both collections explicitly. This avoids PowerShell 5.1's
     # ArgumentException when concatenating certain generic List instances.
     foreach ($el in $hits.Elems) {
+        if (-not $includedTypes.Contains($el.Type)) { continue }
         if ($cSeen.Add($el.Key + '|')) { $frontier.Add([pscustomobject]@{ Elem = $el; Method = $null }) }
     }
     foreach ($el in $targets) {
+        if (-not $includedTypes.Contains($el.Type)) { continue }
         if ($cSeen.Add($el.Key + '|')) { $frontier.Add([pscustomobject]@{ Elem = $el; Method = $null }) }
     }
     $seeds = New-Object System.Collections.Generic.List[object]
-    foreach ($m in $hits.Methods) { $seeds.Add([pscustomobject]@{ Elem = $m.Elem; Method = $m }) }
+    foreach ($m in $hits.Methods) {
+        if ($includedTypes.Contains($m.Elem.Type)) { $seeds.Add([pscustomobject]@{ Elem = $m.Elem; Method = $m }) }
+    }
     foreach ($el in $targets) {
+        if (-not $includedTypes.Contains($el.Type)) { continue }
         foreach ($tm in $el.Methods.Values) { $seeds.Add([pscustomobject]@{ Elem = $el; Method = $tm }) }
     }
 
@@ -1623,18 +1646,19 @@ function Export-AxReference {
         $found = AxRef-FindCallers $model $slice
         $frontier = New-Object System.Collections.Generic.List[object]
         foreach ($c in $found) {
+            if (-not $includedTypes.Contains($c.Elem.Type)) { continue }
             $k = $c.Elem.Key + '|'
             if ($null -ne $c.Method) { $k = $c.Elem.Key + '|' + $c.Method.Key }
             if ($cSeen.Add($k)) {
                 $frontier.Add($c)
-                if ($sel.Count -lt $MaxObjects -or $sel.ContainsKey($c.Elem.Key)) { AxRef-Include $sel $roles $c.Elem ('caller L' + $lvl) }
+                if ($sel.Count -lt $MaxObjects -or $sel.ContainsKey($c.Elem.Key)) { AxRef-Include $sel $roles $c.Elem ('caller L' + $lvl) $includedTypes }
             }
         }
     }
 
     # ---- called (down)
     Write-Host 'Following called objects ...'
-    AxRef-ExpandCalled $model $seeds $CalledDepth $sel $roles $MaxObjects
+    AxRef-ExpandCalled $model $seeds $CalledDepth $sel $roles $MaxObjects $includedTypes
 
     Write-Host ('Objects selected: ' + $sel.Count)
 

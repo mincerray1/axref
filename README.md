@@ -126,6 +126,16 @@ The extractor writes a `reference` folder under the current working directory. I
 
 The X++ output is intended for reading and analysis; it is not an importable XPO export. Comments and XPO metadata are removed. When both TOP and CUS versions exist, they are written separately with `_top` and `_cus` suffixes. The generated project XPO is an importable AX project that lists the selected objects; it does not contain their source code.
 
+## Use it with an AI coding agent
+
+Open the generated `reference` folder as the workspace or root folder in your preferred agent harness, such as VS Code with GitHub Copilot, Codex, or Claude. The generated `AGENTS.md` explains how the reference set is organized, and `MANIFEST.md` lists the extracted objects and why they were included. Then describe the issue in the agent chat and ask it to write a Markdown document with a proposed fix.
+
+For example:
+
+> Help me investigate a bug where posting a sales invoice fails when the order contains a specific discount. Use the AX reference files to find the relevant posting flow and likely cause. Create `fix-plan.md` in this workspace with the objects and methods involved, your diagnosis, step-by-step instructions for fixing it, suggested tests, and any assumptions or missing context. Include the proposed code changes as a unified diff and provide complete, copy-paste-ready replacement methods or code blocks. Don't modify the reference files.
+
+The reference folder gives the agent focused AX context to reason from. Use the plan to guide changes in your actual AX development environment or source repository; the sanitized `.xpp` files are for analysis, not direct import into AX.
+
 ## Main options
 
 | Option | Purpose |
@@ -152,4 +162,4 @@ The extractor uses ripgrep when available to find XPO files containing requested
 
 It builds an in-memory model from TOP and CUS entries, resolves object types and references, and uses the CUS data for customizations while retaining TOP data for the full object view. Keyword matches and object-name matches seed selection. Caller traversal uses reverse reference edges; called-object traversal follows references outward. Both honor the configured depth, included types, and object limit.
 
-For each selected object, the exporter writes a sanitized reading copy under `reference/`, preserving separate TOP and CUS variants when both exist. It removes comments and XPO metadata and records inclusion roles in `MANIFEST.md`. When requested, project generation uses a small sample project XPO to learn the AX project node headers, then writes a project containing only the objects checked in the interactive type-grouped selection. That generated project is an AX-importable project list; the sanitized `.xpp` files remain analysis copies and are not importable XPO objects.
+For each selected object, the exporter writes a sanitized reading copy under `reference/`, preserving separate TOP and CUS variants when both exist. It removes comments and XPO metadata and records inclusion roles in `MANIFEST.md`. When requested, project generation writes a project containing only the objects checked in the interactive type-grouped selection. That generated project is an AX-importable project list; the sanitized `.xpp` files remain analysis copies and are not importable XPO objects.

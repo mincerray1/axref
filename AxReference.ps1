@@ -6,8 +6,8 @@
 #
 #       axref                       (asks everything interactively)
 #       axref -TopFolder top -CusFolder cus -Keyword SalesLineGrouping -CallerDepth 4
-#       axref -Keyword validateWrite -ObjectNameContains PurchAgree,SalesLine -CusObjectPrefix Fox
-#       axref -ObjectNameContains PurchAgree -CusObjectPrefix Fox
+#       axref -Keyword validateWrite -ObjectNameContains PurchAgree,SalesLine -CusObjectPrefix Zzz
+#       axref -ObjectNameContains PurchAgree -CusObjectPrefix Zzz
 #       axref -BuildIndex
 #
 #  Works on Windows PowerShell 5.1 and PowerShell 7.
@@ -1307,6 +1307,57 @@ function AxRef-WriteProject($tpl, [string]$projectName, $elements, [string]$path
     return , $missing
 }
 
+function AxRef-SelectProjectObjects($elements) {
+    $selected = @{}
+    foreach ($el in $elements) { $selected[$el.Key] = $true }
+    $groups = @($elements | Group-Object Type | Sort-Object Name)
+    Write-Host ''
+    Write-Host 'Choose which extracted objects to include in the project XPO.'
+    Write-Host 'All extracted objects start checked. Enter object numbers to toggle them; use all/none for a type.'
+    Write-Host 'Press Enter to move to the next type, or done to finish selection.'
+    foreach ($group in $groups) {
+        $items = @($group.Group | Sort-Object Name)
+        while ($true) {
+            Write-Host ''
+            Write-Host ("{0} ({1} objects)" -f $group.Name, $items.Count)
+            for ($i = 0; $i -lt $items.Count; $i++) {
+                $mark = '[ ]'
+                if ($selected.ContainsKey($items[$i].Key)) { $mark = '[x]' }
+                Write-Host ("  {0,3}. {1} {2}" -f ($i + 1), $mark, $items[$i].Name)
+            }
+            $answer = Read-Host 'Toggle number(s), all, none, Enter for next type, or done'
+            if ([string]::IsNullOrWhiteSpace($answer)) { break }
+            if ($answer.Trim() -match '^(done|finish)$') { break }
+            if ($answer.Trim() -match '^(all|a)$') {
+                foreach ($item in $items) { $selected[$item.Key] = $true }
+                continue
+            }
+            if ($answer.Trim() -match '^(none|n)$') {
+                foreach ($item in $items) { [void]$selected.Remove($item.Key) }
+                continue
+            }
+            $valid = $true
+            foreach ($token in ($answer -split '[,;\s]+')) {
+                if (-not $token) { continue }
+                $number = 0
+                if (-not [int]::TryParse($token, [ref]$number) -or $number -lt 1 -or $number -gt $items.Count) {
+                    Write-Warning ("'{0}' is not a valid object number for this type." -f $token)
+                    $valid = $false
+                    break
+                }
+                $key = $items[$number - 1].Key
+                if ($selected.ContainsKey($key)) { [void]$selected.Remove($key) }
+                else { $selected[$key] = $true }
+            }
+            if (-not $valid) { continue }
+        }
+        if ($answer -and $answer.Trim() -match '^(done|finish)$') { break }
+    }
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($el in $elements) { if ($selected.ContainsKey($el.Key)) { $result.Add($el) } }
+    return , $result.ToArray()
+}
+
 # ===========================================================================
 #  AGENTS.md / MANIFEST.md
 # ===========================================================================
@@ -1521,7 +1572,7 @@ function Export-AxReference {
         }
     }
     if ($kws.Count -eq 0 -and $nameFilters.Count -eq 0) {
-        Write-Host 'Enter keywords one at a time. Press Enter to skip/finish keyword entry; you can add object-name fragments next.'
+        Write-Host 'Keywords are optional. Enter keywords to search code, or press Enter to skip and extract by object-name fragment only.'
         while ($true) {
             $k = Read-Host ('Keyword #' + ($kws.Count + 1))
             if ([string]::IsNullOrWhiteSpace($k)) { break }
@@ -1562,8 +1613,10 @@ function Export-AxReference {
         [void]$includedTypes.Add($type)
     }
 
-    if ($CallerDepth -lt 0) { $CallerDepth = [int](AxRef-Ask 'Caller depth (levels up)' '4') }
-    if ($CalledDepth -lt 0) { $CalledDepth = [int](AxRef-Ask 'Called depth (levels down)' '4') }
+    $defaultDepth = '4'
+    if ($kws.Count -eq 0) { $defaultDepth = '0' }
+    if ($CallerDepth -lt 0) { $CallerDepth = [int](AxRef-Ask 'Caller depth (levels up)' $defaultDepth) }
+    if ($CalledDepth -lt 0) { $CalledDepth = [int](AxRef-Ask 'Called depth (levels down)' $defaultDepth) }
 
     # output folder
     $out = Join-Path $cwd 'reference'
@@ -1667,6 +1720,8 @@ function Export-AxReference {
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     $fileMap = @{}
     $wi = 0
+    $replaceAll = $false
+    $skipAll = $false
     foreach ($el in ($sel.Values | Sort-Object Type, Name)) {
         $wi++
         Write-Progress -Activity 'Writing sanitized files' -Status ('{0} / {1}   {2}' -f $wi, $sel.Count, $el.Name) -PercentComplete ([int](100 * $wi / [Math]::Max(1, $sel.Count)))
@@ -1677,8 +1732,14 @@ function Export-AxReference {
             if (Test-Path -LiteralPath $candidate -PathType Leaf) { $existingFiles.Add($candidate) }
         }
         if ($existingFiles.Count -gt 0) {
-            $answer = AxRef-Ask ("Object '{0}\{1}' already exists. Replace its file(s)? (y/N)" -f $el.Type, $el.Name) 'N'
-            if ($answer -notmatch '^(y|yes)$') {
+            $replace = $replaceAll
+            if (-not $replaceAll -and -not $skipAll) {
+                $answer = AxRef-Ask ("Object '{0}\{1}' already exists. Replace? [y]es/[n]o/[a]ll/[s]kip all" -f $el.Type, $el.Name) 'n'
+                if ($answer -match '^(a|all|replace all)$') { $replaceAll = $true; $replace = $true }
+                elseif ($answer -match '^(s|skip all)$') { $skipAll = $true; $replace = $false }
+                else { $replace = ($answer -match '^(y|yes)$') }
+            }
+            if (-not $replace) {
                 $names = New-Object System.Collections.Generic.List[string]
                 foreach ($path in $existingFiles) { $names.Add(($el.Type + '\' + [System.IO.Path]::GetFileName($path))) }
                 $fileMap[$el.Key] = $names
@@ -1711,7 +1772,10 @@ function Export-AxReference {
         $Project = [bool]($a -match '^(y|yes)$')
     }
     if ($Project) {
-        $defName = 'Reference_' + (($kws[0] -replace '[^A-Za-z0-9_]', ''))
+        $projectSeed = 'Objects'
+        if ($kws.Count -gt 0) { $projectSeed = [string]$kws[0] }
+        elseif ($nameFilters.Count -gt 0) { $projectSeed = [string]$nameFilters[0] }
+        $defName = 'Reference_' + (($projectSeed -replace '[^A-Za-z0-9_]', ''))
         if (-not $ProjectName) { $ProjectName = AxRef-Ask 'Project name' $defName }
         $tpl = AxRef-LoadTemplate
         if ($ProjectSample) { $tpl = AxRef-LearnTemplate $ProjectSample $model }
@@ -1723,7 +1787,14 @@ function Export-AxReference {
             $sp = AxRef-Ask 'Path to that sample project .xpo (Enter to skip)' ''
             if ($sp) { $tpl = AxRef-LearnTemplate $sp $model }
         }
+        $projectElements = @()
         if ($tpl) {
+            $projectElements = AxRef-SelectProjectObjects @($sel.Values)
+            if ($projectElements.Count -eq 0) {
+                Write-Warning 'No objects selected for the project XPO; project generation skipped.'
+            }
+        }
+        if ($tpl -and $projectElements.Count -gt 0) {
             $pf = Join-Path $out ($ProjectName + '.xpo')
             $replaceProject = $true
             if (Test-Path -LiteralPath $pf -PathType Leaf) {
@@ -1731,7 +1802,7 @@ function Export-AxReference {
                 $replaceProject = ($answer -match '^(y|yes)$')
             }
             if ($replaceProject) {
-                $missing = AxRef-WriteProject $tpl $ProjectName ($sel.Values) $pf
+                $missing = AxRef-WriteProject $tpl $ProjectName $projectElements $pf
                 $projectFile = $ProjectName + '.xpo'
                 if ($missing.Count -gt 0) {
                     Write-Warning ('No template for these object types, so those objects are NOT in the project: ' + (($missing | Sort-Object -Unique) -join '; '))
@@ -1739,7 +1810,7 @@ function Export-AxReference {
             }
             else { $projectFile = $ProjectName + '.xpo'; Write-Host 'Kept existing project XPO.' }
         }
-        else { Write-Warning 'Project xpo skipped (no template).' }
+        elseif (-not $tpl) { Write-Warning 'Project xpo skipped (no template).' }
     }
 
     $info = [pscustomobject]@{

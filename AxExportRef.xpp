@@ -1,0 +1,434 @@
+/// Exports AOT objects as XPO into an AOT-like folder tree (reference copy).
+/// Create a class called AotExportRef in the AOT, paste the pieces below, then
+/// open the class (or press F5 on it). Leave RunOn = "Called from" so it runs on
+/// YOUR client and writes to YOUR disk.
+///
+/// A job cannot hold helper methods, which is why this is a class with main().
+
+// ---------------------------------------------------------------------------
+// classDeclaration
+// ---------------------------------------------------------------------------
+class AotExportRef
+{
+    str             exportRoot;
+    str             typeKey;
+    str             prefix;
+    int             maxExports;
+    int             pauseEvery;
+    int             sleepMinSec;
+    int             sleepMaxSec;
+    boolean         sysOnly;
+    boolean         dryRun;
+
+    UtilElementType utilType;
+    boolean         layerCheckAvailable;
+    Map             layerMap;       // lower(name) -> bit 1 = exists in SYS, bit 2 = exists in a higher layer
+
+    int             cntExported;
+    int             cntExisting;
+    int             cntNotSys;
+    int             cntHigher;
+    int             cntFailed;
+
+    TextIo          logFile;
+    System.Random   rnd;
+}
+
+// ---------------------------------------------------------------------------
+// Registry: key -> [AOT path, output sub folder, UtilElementType symbol(s)]
+// Add a row here to support another node type.
+// ---------------------------------------------------------------------------
+private static container typeInfo(str _key)
+{
+    switch (strLwr(_key))
+    {
+        case 'classes'          : return [@'\Classes',                          @'Classes',                         'Class'];
+        case 'forms'            : return [@'\Forms',                            @'Forms',                           'Form'];
+        case 'reports'          : return [@'\Reports',                          @'Reports',                         'Report'];
+        case 'queries'          : return [@'\Queries',                          @'Queries',                         'Query'];
+        case 'macros'           : return [@'\Macros',                           @'Macros',                          'Macro'];
+        case 'jobs'             : return [@'\Jobs',                             @'Jobs',                            'Job'];
+        case 'tables'           : return [@'\Data Dictionary\Tables',           @'Data Dictionary\Tables',          'Table'];
+        case 'maps'             : return [@'\Data Dictionary\Maps',             @'Data Dictionary\Maps',            'Map'];
+        case 'views'            : return [@'\Data Dictionary\Views',            @'Data Dictionary\Views',           'View'];
+        case 'edts'             : return [@'\Data Dictionary\Extended Data Types', @'Data Dictionary\Extended Data Types', 'UserType|ExtendedDataType|Type'];
+        case 'baseenums'        : return [@'\Data Dictionary\Base Enums',       @'Data Dictionary\Base Enums',      'Enum|BaseEnum'];
+        case 'tablecollections' : return [@'\Data Dictionary\Table Collections',@'Data Dictionary\Table Collections','TableCollection'];
+        case 'configkeys'       : return [@'\Data Dictionary\Configuration Keys',@'Data Dictionary\Configuration Keys','ConfigurationKey|ConfigKey|Config'];
+        case 'licensecodes'     : return [@'\Data Dictionary\License Codes',    @'Data Dictionary\License Codes',   'LicenseCode|LicenseKey'];
+        case 'menus'            : return [@'\Menus',                            @'Menus',                           'Menu'];
+        case 'menuitemsdisplay' : return [@'\Menu Items\Display',               @'Menu Items\Display',              'MenuItemDisplay|MenuItem'];
+        case 'menuitemsoutput'  : return [@'\Menu Items\Output',                @'Menu Items\Output',               'MenuItemOutput|MenuItem'];
+        case 'menuitemsaction'  : return [@'\Menu Items\Action',                @'Menu Items\Action',               'MenuItemAction|MenuItem'];
+        case 'services'         : return [@'\Services',                        @'Services',                        'Service'];
+        case 'servicegroups'    : return [@'\Service Groups',                  @'Service Groups',                  'ServiceGroup'];
+        case 'roles'            : return [@'\Security\Roles',                   @'Security\Roles',                  'SecurityRole|Role'];
+        case 'duties'           : return [@'\Security\Duties',                  @'Security\Duties',                 'SecurityDuty|Duty'];
+        case 'privileges'       : return [@'\Security\Privileges',              @'Security\Privileges',             'SecurityPrivilege|Privilege'];
+    }
+    return conNull();
+}
+
+private static str keyList()
+{
+    return 'Classes, Forms, Reports, Queries, Macros, Jobs, Tables, Maps, Views, EDTs, BaseEnums, '
+         + 'TableCollections, ConfigKeys, LicenseCodes, Menus, MenuItemsDisplay, MenuItemsOutput, '
+         + 'MenuItemsAction, Services, ServiceGroups, Roles, Duties, Privileges';
+}
+
+// ---------------------------------------------------------------------------
+// Creates every missing folder level of a path (WinAPI::createDirectory is one level only)
+// ---------------------------------------------------------------------------
+private static void ensureDir(str _path)
+{
+    int     pos = 4;    // skip "C:\"
+    str     partial;
+    boolean done;
+
+    while (!done)
+    {
+        pos = (pos > strLen(_path)) ? 0 : strFind(_path, '\\', pos, strLen(_path) - pos + 1);
+
+        if (pos)
+        {
+            partial = substr(_path, 1, pos - 1);
+            pos++;
+        }
+        else
+        {
+            partial = _path;
+            done    = true;
+        }
+
+        if (partial && !WinAPI::pathExists(partial))
+        {
+            WinAPI::createDirectory(partial);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dialog
+// ---------------------------------------------------------------------------
+private boolean promptUser()
+{
+    Dialog      dlg = new Dialog("Export AOT objects to XPO (reference copy)");
+    DialogField dfRoot, dfType, dfPrefix, dfMax, dfSys, dfDry, dfEvery, dfMinSleep, dfMaxSleep;
+
+    dlg.addText("Type keys: " + AotExportRef::keyList());
+
+    dfType     = dlg.addFieldValue(extendedTypeStr(Name),     'Classes',   "Object type key");
+    dfPrefix   = dlg.addFieldValue(extendedTypeStr(Name),     '',          "Name starts with (blank = any)");
+    dfMax      = dlg.addFieldValue(extendedTypeStr(Integer),  100,         "Max NEW exports (0 = no limit)");
+    dfSys      = dlg.addFieldValue(enumStr(NoYes),            NoYes::Yes,  "SYS layer objects only");
+    dfDry      = dlg.addFieldValue(enumStr(NoYes),            NoYes::Yes,  "Dry run (list only, nothing written)");
+    dfEvery    = dlg.addFieldValue(extendedTypeStr(Integer),  50,          "Pause after every X exports (0 = never)");
+    dfMinSleep = dlg.addFieldValue(extendedTypeStr(Integer),  2,           "Pause min (seconds)");
+    dfMaxSleep = dlg.addFieldValue(extendedTypeStr(Integer),  8,           "Pause max (seconds)");
+    dfRoot     = dlg.addFieldValue(extendedTypeStr(FilePath), @'C:\AX2012_SYS_Reference', "Export root folder");
+
+    if (!dlg.run())
+    {
+        return false;
+    }
+
+    typeKey     = strLRTrim(dfType.value());
+    prefix      = strLwr(strLRTrim(dfPrefix.value()));
+    maxExports  = dfMax.value();
+    sysOnly     = (dfSys.value() == NoYes::Yes);
+    dryRun      = (dfDry.value() == NoYes::Yes);
+    pauseEvery  = dfEvery.value();
+    sleepMinSec = dfMinSleep.value();
+    sleepMaxSec = dfMaxSleep.value();
+    exportRoot  = strLRTrim(dfRoot.value());
+
+    if (subStr(exportRoot, strLen(exportRoot), 1) == '\\')
+    {
+        exportRoot = subStr(exportRoot, 1, strLen(exportRoot) - 1);
+    }
+
+    if (conLen(AotExportRef::typeInfo(typeKey)) == 0)
+    {
+        error(strFmt("Unknown type key '%1'. Valid keys: %2", typeKey, AotExportRef::keyList()));
+        return false;
+    }
+    if (!exportRoot)
+    {
+        error("Export root folder is required.");
+        return false;
+    }
+    if (sleepMaxSec < sleepMinSec)
+    {
+        sleepMaxSec = sleepMinSec;
+    }
+
+    return true;
+}
+
+private boolean matchesPrefix(str _name)
+{
+    return !prefix || strLwr(subStr(_name, 1, strLen(prefix))) == prefix;
+}
+
+// ---------------------------------------------------------------------------
+// Finds which UtilElementType enum symbol exists on this build (names vary),
+// so a wrong guess never breaks compilation.
+// ---------------------------------------------------------------------------
+private void resolveUtilType(str _candidates)
+{
+    DictEnum    de    = new DictEnum(enumNum(UtilElementType));
+    container   names = str2con(_candidates, '|');
+    int         i, val;
+
+    layerCheckAvailable = false;
+
+    for (i = 1; i <= conLen(names); i++)
+    {
+        val = de.name2Value(conPeek(names, i));
+        if (val != -1)
+        {
+            utilType            = val;
+            layerCheckAvailable = true;
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// [existsInSys, existsInHigherLayer] for a top level element
+// ---------------------------------------------------------------------------
+// UtilElements.name is an unbounded string, so it can't be used in a WHERE clause.
+// Instead, load all top level elements of the chosen type once and look names up in memory.
+private void loadLayerMap()
+{
+    UtilElements    ue;
+    int             flags;
+    str             key;
+
+    layerMap = new Map(Types::String, Types::Integer);
+
+    while select utilLevel, name from ue
+        where ue.recordType == utilType
+           && ue.parentId   == 0
+    {
+        key   = strLwr(ue.name);
+        flags = layerMap.exists(key) ? layerMap.lookup(key) : 0;
+        flags = flags | (ue.utilLevel == UtilEntryLevel::sys ? 1 : 2);
+        layerMap.insert(key, flags);
+    }
+}
+
+private container layerInfo(str _name)
+{
+    str key   = strLwr(_name);
+    int flags = layerMap.exists(key) ? layerMap.lookup(key) : 0;
+
+    return [(flags & 1) != 0, (flags & 2) != 0];
+}
+
+private void log(str _name, str _status, boolean _higher)
+{
+    if (logFile)
+    {
+        logFile.write(strFmt("%1,%2,%3,%4,%5",
+                             typeKey,
+                             _name,
+                             _status,
+                             _higher ? 'ALSO_IN_HIGHER_LAYER' : '',
+                             DateTimeUtil::getSystemDateTime()));
+    }
+}
+
+private boolean exportNode(TreeNode _node, str _file, str _name, boolean _higher)
+{
+    if (dryRun)
+    {
+        info(strFmt("[dry run] %1%2", _name, _higher ? "   (also exists in a higher layer)" : ""));
+        return true;
+    }
+
+    try
+    {
+        _node.treeNodeExport(_file);
+    }
+    catch (Exception::Error)
+    {
+        if (WinAPI::fileExists(_file))
+        {
+            WinAPI::deleteFile(_file);  // never leave a half written file, or it would be skipped next run
+        }
+        cntFailed++;
+        this.log(_name, 'FAILED', _higher);
+        return false;
+    }
+
+    this.log(_name, 'EXPORTED', _higher);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+private void run()
+{
+    #AviFiles
+    container   typeDef   = AotExportRef::typeInfo(typeKey);
+    str         aotPath   = conPeek(typeDef, 1);
+    str         subFolder = conPeek(typeDef, 2);
+    str         outDir, name, file;
+    TreeNode    root, node;
+    boolean     inSys, higher, stop, didExport;
+    utcdatetime startTime;
+    int64       elapsedSec;
+    int         sleepMs, pausedMs, scanned, total;
+    real        avgSec;
+    SysOperationProgress progress;
+
+    root = TreeNode::findNode(aotPath);
+    if (!root)
+    {
+        error(strFmt("AOT node '%1' not found.", aotPath));
+        return;
+    }
+
+    outDir = exportRoot + '\\' + subFolder;
+    this.resolveUtilType(conPeek(typeDef, 3));
+    if (layerCheckAvailable)
+    {
+        this.loadLayerMap();
+    }
+    rnd = new System.Random();
+
+    if (sysOnly && !layerCheckAvailable)
+    {
+        warning("Could not resolve the layer lookup for this type: exporting WITHOUT the SYS filter.");
+    }
+
+    if (!dryRun)
+    {
+        AotExportRef::ensureDir(outDir);
+        logFile = new TextIo(exportRoot + '\\_export_log.csv', 'a');
+    }
+
+    // Progress: tracks exports when "Max NEW exports" is set, otherwise nodes scanned
+    total = maxExports ? maxExports : root.AOTchildNodeCount();
+    if (total < 1)
+    {
+        total = 1;
+    }
+    progress = SysOperationProgress::newGeneral(#aviUpdate,
+                                                strFmt("%1 %2", dryRun ? "Dry run:" : "Exporting", typeKey),
+                                                total);
+
+    startLengthyOperation();
+    startTime = DateTimeUtil::getSystemDateTime();
+
+    node = root.AOTfirstChild();
+    while (node && !stop)
+    {
+        name      = node.treeNodeName();
+        didExport = false;
+
+        if (this.matchesPrefix(name))
+        {
+            file = outDir + '\\' + name + '.xpo';
+
+            if (WinAPI::fileExists(file))
+            {
+                cntExisting++;
+            }
+            else
+            {
+                inSys  = true;
+                higher = false;
+
+                if (layerCheckAvailable)
+                {
+                    [inSys, higher] = this.layerInfo(name);
+                }
+
+                if (sysOnly && layerCheckAvailable && !inSys)
+                {
+                    cntNotSys++;    // custom object, you get those from TFS
+                }
+                else
+                {
+                    if (higher)
+                    {
+                        cntHigher++;
+                    }
+
+                    if (this.exportNode(node, file, name, higher))
+                    {
+                        cntExported++;
+                        didExport = true;
+
+                        if (maxExports && cntExported >= maxExports)
+                        {
+                            stop = true;
+                        }
+                        else if (!dryRun && pauseEvery && (cntExported mod pauseEvery) == 0)
+                        {
+                            sleepMs   = rnd.Next(sleepMinSec * 1000, sleepMaxSec * 1000 + 1);
+                            pausedMs += sleepMs;
+                            progress.setText(strFmt("Pausing %1 s ...", sleepMs div 1000));
+                            sleep(sleepMs);
+                        }
+                    }
+                }
+            }
+        }
+
+        scanned++;
+
+        // update after every export, and every 25 nodes while scanning (keeps the UI cheap)
+        if (didExport || (scanned mod 25) == 0)
+        {
+            progress.setCount(maxExports ? cntExported : scanned);
+            progress.setText(strFmt("%1  |  exported %2, existing %3, not SYS %4",
+                                    name, cntExported, cntExisting, cntNotSys));
+        }
+
+        node = node.AOTnextSibling();
+    }
+
+    progress.kill();
+    endLengthyOperation();
+    logFile = null; // closes the log
+
+    info(strFmt("%1: %2 %3, skipped (already on disk) %4, skipped (not in SYS) %5, failed %6, also modified in higher layer %7",
+                typeKey,
+                dryRun ? 'would export' : 'exported',
+                cntExported,
+                cntExisting,
+                cntNotSys,
+                cntFailed,
+                cntHigher));
+
+    elapsedSec = DateTimeUtil::getDifference(DateTimeUtil::getSystemDateTime(), startTime);
+
+    info(strFmt("Elapsed: %1 min %2 s (of which %3 s was pauses)",
+                elapsedSec div 60,
+                elapsedSec mod 60,
+                pausedMs div 1000));
+
+    if (cntExported > 0)
+    {
+        avgSec = elapsedSec / cntExported;
+        info(strFmt("Average per object: %1 s including pauses, %2 s excluding pauses",
+                    round(avgSec, 0.01),
+                    round((elapsedSec - pausedMs div 1000) / cntExported, 0.01)));
+        info(strFmt("Estimate: about %1 min per 1000 objects (including pauses)",
+                    round(avgSec * 1000 / 60, 0.1)));
+    }
+}
+
+public static void main(Args _args)
+{
+    AotExportRef exporter = new AotExportRef();
+
+    if (exporter.promptUser())
+    {
+        exporter.run();
+    }
+}
